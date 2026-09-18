@@ -1,0 +1,41 @@
+--- a/m68kcpu.h	2026-09-18 16:20:59.372461638 +0900
++++ b/m68kcpu.h	2026-09-18 16:20:59.396931881 +0900
+@@ -1482,6 +1482,9 @@
+ 
+ static inline void m68ki_jump_vector(uint vector)
+ {
++#ifdef M68K_EXCEPTION_HOOK
++	M68K_EXCEPTION_HOOK(vector);
++#endif
+ 	REG_PC = (vector<<2) + REG_VBR;
+ 	REG_PC = m68ki_read_data_32(REG_PC);
+ 	m68ki_pc_changed(REG_PC);
+--- a/m68kconf.h	2026-09-18 16:20:59.372280261 +0900
++++ b/m68kconf.h	2026-09-18 16:20:59.397161238 +0900
+@@ -133,8 +133,9 @@
+  * instruction.
+  */
+ #ifndef M68K_EMULATE_RESET
+-#define M68K_EMULATE_RESET          M68K_OPT_OFF
+-#define M68K_RESET_CALLBACK()       your_reset_handler_function()
++#define M68K_EMULATE_RESET          M68K_OPT_SPECIFY_HANDLER
++void emu68k_reset_hook(void);           /* vmpu68: pulses the real RESET line */
++#define M68K_RESET_CALLBACK()       emu68k_reset_hook()
+ #endif
+ 
+ /* If ON, CPU will call the callback when it encounters a cmpi.l #v, dn
+@@ -215,8 +216,12 @@
+  * instruction.
+  */
+ #ifndef M68K_INSTRUCTION_HOOK
+-#define M68K_INSTRUCTION_HOOK       M68K_OPT_OFF
+-#define M68K_INSTRUCTION_CALLBACK(pc) your_instruction_hook_function(pc)
++#define M68K_INSTRUCTION_HOOK       M68K_OPT_ON
++void emu68k_trace_hook(unsigned int pc);   /* vmpu68: PC history ring */
++#define M68K_INSTRUCTION_CALLBACK(pc) emu68k_trace_hook(pc)
++/* vmpu68: every exception/interrupt vector taken (see emu68k_exception_hook) */
++void emu68k_exception_hook(unsigned int vector);
++#define M68K_EXCEPTION_HOOK(v) emu68k_exception_hook(v)
+ #endif
+ 
+ 

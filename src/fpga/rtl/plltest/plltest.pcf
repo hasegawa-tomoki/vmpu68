@@ -1,0 +1,6 @@
+set_io pi_ad2 114
+set_io pi_irq 119
+set_io -pullup no led_r 94
+set_io -pullup no led_g 91
+set_io -pullup no led_b 90
+set_io bgack49 49

@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vfd68 / vhd68 / vmpu68 finder</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#14161a;color:#e8e8e8}
+header{padding:10px 16px;background:#20242c}
+header h1{font-size:18px;margin:0;color:#7ec8ff}
+header p{font-size:12px;color:#9aa;margin:4px 0 0}
+main{max-width:720px;margin:0 auto;padding:12px}
+.card{background:#20242c;border-radius:8px;padding:12px 14px;margin:10px 0}
+.card h2{font-size:14px;margin:0 0 8px;color:#9fd49f}
+button{background:#31405a;color:#e8e8e8;border:0;border-radius:5px;padding:6px 12px;margin:2px 6px 2px 0;cursor:pointer;font-size:13px}
+button:hover{background:#3f5378}
+button:disabled{opacity:.4;cursor:default}
+input[type=text]{background:#14161a;color:#e8e8e8;border:1px solid #2a2f38;border-radius:5px;padding:6px 8px;font-size:13px;width:130px}
+.preset{background:#2a3240;font-size:12px;padding:4px 8px}
+#bar{height:6px;background:#2a2f38;border-radius:3px;overflow:hidden;margin:10px 0}
+#fill{height:100%;width:0;background:#7ec8ff;transition:width .2s}
+.dev{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #2a2f38}
+.dev:last-child{border-bottom:none}
+.tag{display:inline-block;font-size:11px;font-weight:700;border-radius:4px;padding:2px 7px;margin-right:8px;min-width:38px;text-align:center}
+.tag.hd{background:#274a2b;color:#9fd49f}
+.tag.fd{background:#27394a;color:#7ec8ff}
+.tag.mp{background:#3d2f4a;color:#d8a8ff}
+.tag.un{background:#4a3a27;color:#d4b88f}
+a{color:#7ec8ff;text-decoration:none;font-weight:600}
+a:hover{text-decoration:underline}
+.meta{font-size:12px;color:#9aa}
+#msg{font-size:13px;color:#9aa;margin:6px 0}
+.note{font-size:12px;color:#9aa;border-left:3px solid #45506a;padding:2px 10px;margin-top:10px}
+</style>
+</head>
+<body>
+<header>
+<h1>vfd68 / vhd68 / vmpu68 finder</h1>
+<p>同じ Wi-Fi(LAN)の中にいる vfd68 / vhd68 / vmpu68 を探して、Web UI へのリンクを表示します</p>
+</header>
+<main>
+
+<div class="card">
+<h2>スキャン範囲</h2>
+<div>
+<input type="text" id="base" placeholder="192.168.0"> <span class="meta">.1 〜 .254 を探します</span>
+</div>
+<div style="margin-top:6px">
+<button class="preset" onclick="setBase('192.168.0')">192.168.0.*</button>
+<button class="preset" onclick="setBase('192.168.1')">192.168.1.*</button>
+<button class="preset" onclick="setBase('192.168.11')">192.168.11.*</button>
+<button class="preset" onclick="setBase('192.168.10')">192.168.10.*</button>
+<button class="preset" onclick="setBase('10.0.0')">10.0.0.*</button>
+</div>
+<div style="margin-top:8px">
+<button id="go" onclick="scan()">スキャン開始</button>
+<button id="stop" onclick="stopScan()" disabled>停止</button>
+</div>
+<div id="bar"><div id="fill"></div></div>
+<div id="msg">「スキャン開始」を押してください。1 回のスキャンは 20 秒ほどです。</div>
+</div>
+
+<div class="card">
+<h2>見つかった機器</h2>
+<div id="found"><span class="meta">(まだありません)</span></div>
+</div>
+
+<div class="note">
+このページはお使いのブラウザから各アドレスの <code>/api/status</code> を順に呼んで探します。
+ファイルをPCに保存してダブルクリックで開くだけで動きます(https のサーバに置くと動きません)。
+機器が省電力で応答しない場合や別サブネットの場合は見つかりません。
+IPアドレスの先頭3つ(例: 192.168.0)は、PCの「ネットワーク設定」に表示されるIPアドレスと同じものを指定してください。
+</div>
+
+</main>
+<script>
+'use strict';
+let aborting=false, running=false;
+const $=id=>document.getElementById(id);
+
+// 前回使ったサブネットを覚えておく
+try{ $('base').value = localStorage.getItem('lanfinder.base') || '192.168.0'; }catch(e){ $('base').value='192.168.0'; }
+function setBase(b){ $('base').value=b; }
+
+function fmtUp(sec){ sec=Number(sec)||0; const h=Math.floor(sec/3600), m=Math.floor(sec%3600/60); return h?h+'h'+m+'m':m?m+'m':sec+'s'; }
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function row(ip, j){
+  let kind, cls, extra='';
+  if (j && (j.device==='vmpu68' || j.firmware==='baremetal')) {
+    kind='vmpu68'; cls='mp';                     // X68000 MPU ボード: version は firmware のビルド日時
+    const parts=[j.mock?'MOCK':'FPGA'];
+    if (j.uptime!==undefined) parts.push('稼働 '+fmtUp(j.uptime));
+    if (j.update && j.update.busy) parts.push('更新中: '+j.update.phase);
+    extra=parts.join(' · ');
+  } else if (j && Array.isArray(j.ids)) {
+    kind='vhd68'; cls='hd';
+    const m=j.ids.filter(d=>d && d.mounted).length;
+    extra='マウント中 '+m+' 台';
+  } else if (j && (j.hw!==undefined || j.wdboot!==undefined)) {
+    kind='vfd68'; cls='fd';
+    if (j.hw) extra='HW '+j.hw;
+  } else {
+    kind='不明'; cls='un';
+  }
+  const name=j && j.name ? j.name : '';         // cfg "name=" (対応firmwareのみ)
+  const ver=j && j.version ? (cls==='mp'?'fw '+String(j.version).replace(/\s+/g,' '):'v'+j.version) : '';
+  const mac=j && j.mac ? j.mac : '';
+  const sub=[ver, mac, extra].filter(Boolean).join(' · ');
+  return '<div class="dev"><span>'
+    + '<div><span class="tag '+cls+'">'+kind+'</span>'
+    + '<a href="http://'+ip+'/" target="_blank">'+ip+'</a>'
+    + (name?' <b style="margin-left:8px">'+esc(name)+'</b>':'')
+    + '</div>'
+    + (sub?'<div class="meta" style="margin:2px 0 0 60px">'+sub+'</div>':'')
+    + '</span><span><button onclick="window.open(\'http://'+ip+'/\')">開く</button></span></div>';
+}
+
+async function probe(ip){
+  const ac=new AbortController();
+  const t=setTimeout(()=>ac.abort(), 1200);
+  try{
+    const r=await fetch('http://'+ip+'/api/status', {signal:ac.signal, cache:'no-store'});
+    clearTimeout(t);
+    if(!r.ok) return null;
+    const j=await r.json();
+    if(j && j.version!==undefined) return j;   // vfd68/vhd68/vmpu68 系の応答だけ拾う
+    return null;
+  }catch(e){ clearTimeout(t); return null; }
+}
+
+async function scan(){
+  if(running) return;
+  const base=($('base').value||'').trim().replace(/\.$/,'');
+  if(!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(base)){ $('msg').textContent='サブネットは「192.168.0」の形式で入れてください'; return; }
+  try{ localStorage.setItem('lanfinder.base', base); }catch(e){}
+  running=true; aborting=false;
+  $('go').disabled=true; $('stop').disabled=false;
+  $('found').innerHTML='<span class="meta">(スキャン中...)</span>';
+  let done=0, hits=[];
+  const ips=[]; for(let n=1;n<=254;n++) ips.push(base+'.'+n);
+  const CONC=24;
+  let idx=0;
+  async function worker(){
+    while(idx<ips.length && !aborting){
+      const ip=ips[idx++];
+      const j=await probe(ip);
+      done++;
+      $('fill').style.width=Math.floor(done/ips.length*100)+'%';
+      $('msg').textContent='スキャン中... '+done+'/254'+(hits.length?'('+hits.length+' 台発見)':'');
+      if(j){ hits.push([ip,j]); render(hits); }
+    }
+  }
+  await Promise.all(Array.from({length:CONC},worker));
+  running=false;
+  $('go').disabled=false; $('stop').disabled=true;
+  $('fill').style.width='100%';
+  $('msg').textContent=(aborting?'停止しました。':'スキャン完了。')+' '+hits.length+' 台見つかりました。';
+  if(!hits.length) $('found').innerHTML='<span class="meta">見つかりませんでした。機器の電源とサブネット(PCと同じ 192.168.x)を確認してください。</span>';
+}
+function render(hits){
+  hits.sort((a,b)=>{const pa=a[0].split('.').map(Number),pb=b[0].split('.').map(Number);return pa[3]-pb[3]});
+  $('found').innerHTML=hits.map(h=>row(h[0],h[1])).join('');
+}
+function stopScan(){ aborting=true; }
+</script>
+</body>
+</html>

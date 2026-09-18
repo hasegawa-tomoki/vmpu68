@@ -1,0 +1,93 @@
+# vmpu68.pcf — generated from EasyEDA schematic 238d9b08171ea3fe (board 1.2, phase 2)
+# pin 129 is reserved as the top PLL output pad (SB_PLL40_CORE) — do not assign
+set_io clk16 93
+set_io la[1] 88
+set_io la[2] 87
+set_io la[3] 83
+set_io la[4] 82
+set_io la[5] 81   # core 1.0: U10 ch2/ch4 crossed (LA5->A7, LA7->A5): swapped with la[7]
+set_io la[6] 80
+set_io la[7] 79   # see la[5]
+set_io la[8] 113
+set_io la[9] 112
+set_io la[10] 107
+set_io la[11] 106
+set_io la[12] 105
+set_io la[13] 104
+set_io la[14] 102
+set_io la[15] 101
+set_io la[16] 11
+set_io la[17] 10
+set_io la[18] 9
+set_io la[19] 8
+set_io la[20] 7
+set_io la[21] 3
+set_io la[22] 2
+set_io la[23] 1
+set_io ld[0] 31
+set_io ld[1] 32
+set_io ld[2] 33
+set_io ld[3] 34
+set_io ld[4] 37
+set_io ld[5] 29
+set_io ld[6] 28
+set_io ld[7] 26
+set_io ld[8] 25
+set_io ld[9] 24
+set_io ld[10] 23
+set_io ld[11] 22
+set_io ld[12] 21
+set_io ld[13] 20
+set_io ld[14] 19
+set_io ld[15] 12
+set_io l_as_n 38
+set_io l_uds_n 39
+set_io l_lds_n 41
+set_io l_rw 42
+set_io lfc[0] 43
+set_io lfc[1] 44
+set_io lfc[2] 45
+set_io l_vma_n 47
+set_io l_dtack_n 48
+set_io l_bgack_n 49
+set_io l_br_n 52
+set_io l_halt_n 56
+set_io l_reset_n 60
+set_io l_vpa_n 61
+set_io l_berr_n 62
+set_io rst_drv 63
+set_io hlt_drv 64
+set_io l_bg_n 74   # see l_e
+set_io l_e 73   # core 1.0: U8 ch7/ch8 crossed (L_E->BG_N, L_BG_N->E): swapped with l_bg_n
+set_io l_ipl_n[2] 75
+set_io l_ipl_n[1] 76
+set_io l_ipl_n[0] 78
+set_io buf_o_oe_n 95
+set_io buf_a_oe_n 96
+set_io buf_d_dir 97
+set_io buf_d_oe_n 98
+set_io buf_a_dir 99
+set_io pi_irq 119
+set_io pi_wr_n 128
+set_io pi_rd_n 130
+set_io pi_reg_a[0] 118
+set_io pi_reg_a[1] 141
+set_io -pullup no led_r 94
+set_io -pullup no led_g 91
+set_io -pullup no led_b 90
+set_io pi_ad[0] 143
+set_io pi_ad[1] 144
+set_io pi_ad[2] 114
+set_io pi_ad[3] 136
+set_io pi_ad[4] 137
+set_io pi_ad[5] 135
+set_io pi_ad[6] 134
+set_io pi_ad[7] 121
+set_io pi_ad[8] 120
+set_io pi_ad[9] 122
+set_io pi_ad[10] 138
+set_io pi_ad[11] 139
+set_io pi_ad[12] 115
+set_io pi_ad[13] 116
+set_io pi_ad[14] 142
+set_io pi_ad[15] 117

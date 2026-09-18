@@ -1,0 +1,63 @@
+diff --git a/include/circle/net/http.h b/include/circle/net/http.h
+index 28a3779..6b47d8c 100644
+--- a/include/circle/net/http.h
++++ b/include/circle/net/http.h
+@@ -28,7 +28,7 @@
+ #define HTTP_MAX_URI		HTTP_MAX_REQUEST_LINE
+ #define HTTP_MAX_PATH		256
+ #define HTTP_MAX_PARAMS		(HTTP_MAX_URI-HTTP_MAX_PATH-1)
+-#define HTTP_MAX_FORM_DATA	2048
++#define HTTP_MAX_FORM_DATA	16384
+ #define HTTP_MAX_MULTIPART_BOUNDARY 100
+ 
+ enum THTTPRequestMethod
+diff --git a/lib/usb/gadget/usbcdcgadgetendpoint.cpp b/lib/usb/gadget/usbcdcgadgetendpoint.cpp
+index 813198b..2175a51 100644
+--- a/lib/usb/gadget/usbcdcgadgetendpoint.cpp
++++ b/lib/usb/gadget/usbcdcgadgetendpoint.cpp
+@@ -147,16 +147,6 @@ int CUSBCDCGadgetEndpoint::Write (const void *pData, unsigned nLength)
+ 
+ 	m_SpinLock.Acquire ();
+ 
+-	if (m_nStatus)
+-	{
+-		int nStatus = m_nStatus;
+-		m_nStatus = 0;
+-
+-		m_SpinLock.Release ();
+-
+-		return nStatus;
+-	}
+-
+ 	unsigned nBytesFree = GetQueueBytesFree ();
+ 	if (!nBytesFree)
+ 	{
+@@ -200,19 +190,19 @@ int CUSBCDCGadgetEndpoint::Read (void *pBuffer, unsigned nLength)
+ {
+ 	m_SpinLock.Acquire ();
+ 
+-	if (m_nStatus)
++	unsigned nBytesAvail = GetQueueBytesAvail ();
++	if (!nBytesAvail)
+ 	{
+-		int nStatus = m_nStatus;
+-		m_nStatus = 0;
++		if (m_nStatus)		// report the error once drained
++		{
++			int nStatus = m_nStatus;
++			m_nStatus = 0;
+ 
+-		m_SpinLock.Release ();
++			m_SpinLock.Release ();
+ 
+-		return nStatus;
+-	}
++			return nStatus;
++		}
+ 
+-	unsigned nBytesAvail = GetQueueBytesAvail ();
+-	if (!nBytesAvail)
+-	{
+ 		m_SpinLock.Release ();
+ 
+ 		return 0;

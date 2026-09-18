@@ -1,0 +1,6 @@
+{
+  "bus": [
+    { "min_mhz": 0,    "wr_setup": "auto", "wait_ns": 500, "io_mhz": 10, "ai": true },
+    { "min_mhz": 13.0, "wr_setup": "auto", "wait_ns": 500, "io_mhz": 16, "ai": true }
+  ]
+}

@@ -1,0 +1,115 @@
+<!-- SPDX-License-Identifier: MIT -->
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vmpu68</title>
+<style>
+ body{font-family:ui-monospace,Menlo,monospace;background:#14171c;color:#dde3ea;margin:0;padding:16px}
+ h1{font-size:18px;margin:0 0 12px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+ .card{background:#1d2229;border:1px solid #2c333d;border-radius:8px;padding:12px}
+ .card h2{font-size:13px;margin:0 0 8px;color:#8fa3b8;text-transform:uppercase;letter-spacing:.05em}
+ table{border-collapse:collapse;width:100%;font-size:13px}
+ td{padding:2px 6px;border-bottom:1px solid #262d36}
+ td:first-child{color:#8fa3b8}
+ input,button,select{background:#262d36;color:#dde3ea;border:1px solid #3a4450;border-radius:4px;padding:4px 8px;font:inherit}
+ button{cursor:pointer}
+ button:hover{background:#33507a}
+ .ok{color:#6fd18b}.bad{color:#ff7b72}
+ pre{font-size:12px;max-height:200px;overflow:auto;background:#12151a;padding:8px;border-radius:4px}
+ .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:4px 0}
+</style>
+<h1>vmpu68 <span id=mockbadge></span></h1>
+<div class=grid>
+ <div class=card><h2>Status</h2><table id=st></table></div>
+ <div class=card><h2>Bus peek / poke</h2>
+  <div class=row>addr <input id=addr size=9 value=0x001000>
+   <select id=word><option value=1>word</option><option value=0>byte</option></select></div>
+  <div class=row><button onclick=peek()>Read</button>
+   <input id=wdata size=6 value=0xBEEF><button onclick=poke()>Write</button></div>
+  <div class=row>→ <span id=busout>-</span></div></div>
+ <div class=card><h2>Snoop</h2>
+  <div class=row><button onclick=drain()>Drain</button>
+   <button id=mockdma style="display:none" onclick=mockdma()>Mock DMA</button></div>
+  <pre id=snoop>-</pre></div>
+ <div class=card><h2>Control</h2>
+  <div class=row>LED:
+   <button onclick=led(4)>R</button><button onclick=led(2)>G</button>
+   <button onclick=led(1)>B</button><button onclick=led(0)>off</button></div>
+  <div class=row>68000:
+   <button onclick=drv(1,-1)>RESET on</button><button onclick=drv(0,-1)>off</button>
+   <button onclick=drv(-1,1)>HALT on</button><button onclick=drv(-1,0)>off</button></div></div>
+ <div class=card><h2>FPGA bitstream</h2>
+  <div class=row><input type=file id=bit><button onclick=flash()>Flash + boot</button></div>
+  <div class=row>JEDEC: <span id=jedec>-</span> <button onclick=flashid()>read</button></div>
+  <div class=row><span id=flashout></span></div></div>
+ <div class=card><h2>OTA firmware</h2>
+  <div class=row><input type=file id=fw><button onclick=ota()>Upload</button></div>
+  <div class=row><span id=otaout></span></div></div>
+ <div class=card><h2>Emulator (68000)</h2>
+  <div class=row><input type=file id=emubin> at <input id=emuaddr size=8 value=0x0>
+   <button onclick=emuload()>Load</button></div>
+  <div class=row><button onclick=emu('reset')>Reset</button>
+   <button onclick=emu('start')>Start</button><button onclick=emu('stop')>Stop</button></div>
+  <table id=emust></table></div>
+ <div class=card><h2>Log</h2><pre id=log>-</pre></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const j=async(u,opt)=>(await fetch(u,opt)).json();
+const hex=(v,n)=>'0x'+v.toString(16).toUpperCase().padStart(n,'0');
+async function tick(){
+ try{
+  const s=await j('/api/status');
+  $('mockbadge').textContent=s.mock?'(MOCK)':'';
+  $('mockdma').style.display=s.mock?'':'none';
+  $('st').innerHTML=`
+   <tr><td>FPGA</td><td class=${s.sig_ok?'ok':'bad'}>${s.sig_ok?'OK':'NO RESPONSE'} (sig ${hex(s.signature,4)})</td></tr>
+   <tr><td>busy / fault</td><td>${s.busy} / <span class=${s.fault?'bad':'ok'}>${s.fault}</span></td></tr>
+   <tr><td>IPL</td><td>${s.ipl}</td></tr>
+   <tr><td>RESET in / HALT in</td><td>${s.reset_in} / ${s.halt_in}</td></tr>
+   <tr><td>snoop pending</td><td>${s.snoop_avail}</td></tr>`;
+  $('log').textContent=await (await fetch('/api/log')).text();
+  const e=await j('/api/emu/state');
+  $('emust').innerHTML=`
+   <tr><td>state</td><td>${e.inited?(e.running?'<span class=ok>RUNNING</span>':'stopped'):'not initialised'}</td></tr>
+   <tr><td>PC / SR</td><td>${hex(e.pc,6)} / ${hex(e.sr,4)}</td></tr>
+   <tr><td>D0-3</td><td>${e.d.slice(0,4).map(x=>hex(x,8)).join(' ')}</td></tr>
+   <tr><td>A0-3</td><td>${e.a.slice(0,4).map(x=>hex(x,8)).join(' ')}</td></tr>
+   <tr><td>cycles / snoops</td><td>${e.cycles} / ${e.snoops}</td></tr>`;
+ }catch(e){ $('st').innerHTML='<tr><td class=bad>mgmtd unreachable</td></tr>'; }
+}
+async function emu(op){ await fetch('/api/emu/'+op,{method:'POST'}); tick(); }
+async function emuload(){
+ const f=$('emubin').files[0];
+ if(!f) return;
+ await fetch(`/api/emu/load?addr=${$('emuaddr').value}`,{method:'POST',body:await f.arrayBuffer()});
+ tick();
+}
+async function peek(){
+ const r=await j(`/api/bus/read?addr=${$('addr').value}&word=${$('word').value}`);
+ $('busout').textContent=r.fault?'FAULT':hex(r.value,4);
+}
+async function poke(){
+ const r=await j(`/api/bus/write?addr=${$('addr').value}&word=${$('word').value}&data=${$('wdata').value}`,{method:'POST'});
+ $('busout').textContent=r.fault?'FAULT':'written';
+}
+async function drain(){
+ const r=await j('/api/snoop?max=200');
+ $('snoop').textContent=r.count?r.records.map(x=>`${hex(x.addr,6)} = ${hex(x.data,4)} (u${x.uds}l${x.lds})`).join('\n'):'(empty)';
+}
+async function mockdma(){ await fetch('/api/mock/dma?addr=0x2000&data=0xD000&n=5',{method:'POST'}); drain(); }
+async function led(v){ await fetch('/api/led?v='+v,{method:'POST'}); }
+async function drv(r,h){ await fetch(`/api/drv?reset=${r}&halt=${h}`,{method:'POST'}); }
+async function flashid(){ const r=await j('/api/fpga/flashid'); $('jedec').textContent=r.id.map(x=>hex(x,2)).join(' '); }
+async function upload(fileEl,url,outEl){
+ const f=$(fileEl).files[0];
+ if(!f){ $(outEl).textContent='select a file'; return; }
+ $(outEl).textContent='uploading '+f.size+' bytes...';
+ const r=await j(url,{method:'POST',body:await f.arrayBuffer()});
+ $(outEl).textContent=JSON.stringify(r);
+}
+const flash=()=>upload('bit','/api/fpga/flash','flashout');
+const ota=()=>upload('fw','/api/ota','otaout');
+tick(); setInterval(tick,1500);
+</script>

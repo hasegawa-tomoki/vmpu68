@@ -1,0 +1,10 @@
+# SD カード直下に wpa_supplicant.conf としてコピーし、SSID/パスフレーズを設定してください
+# ステルス SSID を使用したい場合は network={} の中に scan_ssid=1 を追加してください
+# WPA2 のみ対応です
+country=JP
+network={
+	ssid="YOUR_SSID"
+	psk="YOUR_PASSPHRASE"
+	proto=WPA2
+	key_mgmt=WPA-PSK
+}

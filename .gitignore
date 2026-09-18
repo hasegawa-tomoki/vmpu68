@@ -1,0 +1,33 @@
+# ビルド生成物(配布物は release/ に置く)
+src/pi/baremetal/*.img
+src/pi/baremetal/*.o
+src/pi/baremetal/*.d
+src/pi/baremetal/*.map
+src/pi/core/*.o
+src/pi/core/test_emu
+src/pi/core/jit_test
+src/pi/core/jit_emit_test
+src/pi/mgmtd/*.o
+src/pi/mgmtd/mgmtd
+src/pi/pi/*.o
+src/pi/pi/buscheck
+src/pi/pi/flash68
+src/fpga/fpga/*.json
+src/fpga/fpga/*.asc
+src/fpga/fpga/*.vvp
+src/fpga/fpga/*.vcd
+src/fpga/fpga/*.bak*
+src/x68k/vmpu68x/*.bin
+src/x68k/vmpu68x/*.o
+# 外部ライブラリ(circle と Musashi は別途取得してパッチを当てる: src/third_party/patches/README.md)
+src/third_party/circle/
+src/third_party/Musashi/
+# 認証情報
+src/pi/baremetal/wlan-files/wpa_supplicant.conf
+# 作業ファイル
+__pycache__/
+*.pyc
+.DS_Store
+.tmp_*
+src/x68k/jitbench/*.bin
+src/x68k/jitbench/*.X

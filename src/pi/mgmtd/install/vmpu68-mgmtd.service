@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# systemd unit: vmpu68 management daemon
+[Unit]
+Description=vmpu68 management daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/vmpu68/mgmtd --port 80 --ota-path /opt/vmpu68/ota-staged.bin
+Restart=always
+RestartSec=2
+# GPIO access
+SupplementaryGroups=gpio
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+User=vmpu68
+Group=vmpu68
+
+[Install]
+WantedBy=multi-user.target
