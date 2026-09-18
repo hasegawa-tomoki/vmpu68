@@ -209,6 +209,28 @@ void vmpu68_set_snoop_hook(void (*fn)(void));
 void     vmpu68_set_snoop_hook_core(int core);   /* only this core runs the hook from busy waits (-1 = any) */
 
 /* flash access (CRESET_B held low during the whole session) */
+/* SMI transport (core 2.x only): the SoC's parallel-bus engine drives
+ * REG_A/WR#/RD#/AD (SA0-1, SWE_N, SOE_N, SD0-15 on ALT1) with programmable
+ * setup/strobe/hold in SMI clock cycles instead of GPIO strobes paced by
+ * the CPU.  The register protocol is unchanged; the hold read (RD# held
+ * low while PI_IRQ is polled) becomes "poll PI_IRQ, then one DATA read".
+ * vmpu68_set_smi(1) needs vmpu68_set_smi_base() (bare metal) and the 2.x
+ * layout; returns 0, or -1 when unavailable.  Timing: 0 = keep. */
+int      vmpu68_set_smi(int on);
+int      vmpu68_smi_io(void);
+void     vmpu68_smi_timing(unsigned div, unsigned wsetup, unsigned wstrobe, unsigned whold,
+                           unsigned rsetup, unsigned rstrobe, unsigned rhold, unsigned pace);
+void     vmpu68_smi_get(unsigned out[8]);   /* div, wsetup, wstrobe, whold, rsetup, rstrobe, rhold, pace */
+void     vmpu68_smi_stats(uint32_t out[4], int clear);   /* writes, reads, done timeouts, extra DONE polls on reads */
+void     vmpu68_smi_flags(unsigned f);      /* bit0: cache SMIDA, bit1: no DONE clear (experiments) */
+unsigned vmpu68_smi_get_flags(void);
+void     vmpu68_smi_rdelay(unsigned ns);   /* spin before the first DONE poll of a read */
+unsigned vmpu68_smi_get_rdelay(void);
+void     vmpu68_smi_bench(uint32_t out[5]);  /* ns per op: DCS read, DA write, reg write, reg read, GPLEV read */
+#ifdef VMPU68_BAREMETAL
+void     vmpu68_set_smi_base(volatile uint32_t *smi_base, volatile uint32_t *cm_base);
+#endif
+
 void vmpu68_flash_begin(void);
 void vmpu68_flash_end(void);            /* releases CRESET_B -> FPGA boots */
 void vmpu68_flash_xfer(const uint8_t *tx, uint8_t *rx, unsigned n, int cont);

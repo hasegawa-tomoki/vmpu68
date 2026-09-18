@@ -1,17 +1,5 @@
---- a/m68kcpu.h	2026-09-18 16:20:59.372461638 +0900
-+++ b/m68kcpu.h	2026-09-18 16:20:59.396931881 +0900
-@@ -1482,6 +1482,9 @@
- 
- static inline void m68ki_jump_vector(uint vector)
- {
-+#ifdef M68K_EXCEPTION_HOOK
-+	M68K_EXCEPTION_HOOK(vector);
-+#endif
- 	REG_PC = (vector<<2) + REG_VBR;
- 	REG_PC = m68ki_read_data_32(REG_PC);
- 	m68ki_pc_changed(REG_PC);
---- a/m68kconf.h	2026-09-18 16:20:59.372280261 +0900
-+++ b/m68kconf.h	2026-09-18 16:20:59.397161238 +0900
+--- a/m68kconf.h	2026-09-19 00:35:08.909521378 +0900
++++ b/m68kconf.h	2026-09-18 16:21:00.318822859 +0900
 @@ -133,8 +133,9 @@
   * instruction.
   */
@@ -38,4 +26,31 @@
 +#define M68K_EXCEPTION_HOOK(v) emu68k_exception_hook(v)
  #endif
  
+ 
+--- a/m68kcpu.h	2026-09-19 00:35:08.911521337 +0900
++++ b/m68kcpu.h	2026-09-19 00:34:25.171556111 +0900
+@@ -1482,6 +1482,9 @@
+ 
+ static inline void m68ki_jump_vector(uint vector)
+ {
++#ifdef M68K_EXCEPTION_HOOK
++	M68K_EXCEPTION_HOOK(vector);
++#endif
+ 	REG_PC = (vector<<2) + REG_VBR;
+ 	REG_PC = m68ki_read_data_32(REG_PC);
+ 	m68ki_pc_changed(REG_PC);
+@@ -1960,7 +1963,13 @@
+ 	uint sr = m68ki_init_exception();
+ 
+ 	/* Note: This is implemented for 68010 only! */
+-	m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
++	/* vmpu68: a 68000 pushes the 14-byte group-0 frame (SSW, access address,
++	 * IR, SR, PC); software probing hardware with a bus-error handler expects
++	 * it (VMPU68.X, device drivers).  The host sets m68ki_aerr_* first. */
++	if (CPU_TYPE_IS_000(CPU_TYPE))
++		m68ki_stack_frame_buserr(sr);
++	else
++		m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
+ 
+ 	m68ki_jump_vector(EXCEPTION_BUS_ERROR);
  

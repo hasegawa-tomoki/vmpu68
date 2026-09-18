@@ -88,15 +88,24 @@ static inline int fault_raise(void)
     return 1;
 }
 
-static void bus_fault_at(uint32_t a)
+/* the 68000 bus-error frame (Musashi patched to push it: 14 bytes with the
+ * access address and the special status word) takes these from Musashi's
+ * address-error globals: set them before raising */
+extern unsigned int m68ki_aerr_address, m68ki_aerr_write_mode, m68ki_aerr_fc;
+static void bus_fault_rw(uint32_t a, int wr)
 {
     fault_count++;
     fault_addr = a;
     fault_pc = m68k_get_reg(NULL, M68K_REG_PPC);
     hw_clear_fault();
+    m68ki_aerr_address = a & 0xFFFFFF;
+    m68ki_aerr_write_mode = wr ? 0 : 0x10;                  /* SSW bit 4: 1 = read */
+    m68ki_aerr_fc = (m68k_get_reg(NULL, M68K_REG_SR) & 0x2000) ? 5 : 1;   /* data space */
     fault_raise();
 }
-#define bus_fault() bus_fault_at(a)
+static void bus_fault_at(uint32_t a) { bus_fault_rw(a, 0); }
+#define bus_fault()   bus_fault_rw(a, 0)
+#define bus_fault_w() bus_fault_rw(a, 1)
 
 /* PC history ring (instruction hook) for post-mortem tracing */
 #define TRACE_N 256
@@ -366,13 +375,15 @@ void emu68k_set_cpu30(int on)
 
 static inline int xt30_hit(uint32_t a) { return xt30_on && (a & ~1u) == xt30_port; }
 
-/* VMPU68 information port, $ECFF00-$ECFFFF (user I/O area, 256 bytes).
+/* VMPU68 information port, $ECD000-$ECD0FF (user I/O area, 256 bytes; was
+ * $ECFF00 in 1.0.0 - that block is FineScanner-X68 slot F / the BANK RAM
+ * board's register, and si.x scans $ECnFF0 for the scanner).
  * Software on the X68000 reads a record the kernel refreshes about once a
  * second (emu68k_info_set): "VMPU" magic, a live microsecond counter at +4
  * (reading the high word at +4 latches the value, +6 returns the low word),
  * then 68000-equivalent speed, bus clock, RAM size, flags, version, build
  * and free text.  All values big-endian.  Writes are accepted and ignored. */
-#define INFO_BASE 0xECFF00u
+#define INFO_BASE 0xECD000u
 static uint8_t  info_buf[256];
 static uint32_t info_us_latch;
 static inline int info_hit(uint32_t a) { return (a & 0xFFFFFF00u) == INFO_BASE; }
@@ -400,7 +411,7 @@ static uint32_t info_wlog_n;
 #define INFO_CMD_N 8
 static volatile uint32_t info_cmdq[INFO_CMD_N];   /* [23:16] offset, [15:0] value */
 static volatile unsigned info_cmd_wp, info_cmd_rp;
-static char info_wbuf[32];                    /* $ECFFC0-$ECFFDF: text written by VMPU68.X (the host name) */
+static char info_wbuf[32];                    /* $ECD0C0-$ECD0DF: text written by VMPU68.X (the host name) */
 static void info_write16(uint32_t a, uint16_t v)
 {
     info_wlog[info_wlog_n++ % INFO_WLOG_N] = ((a & 0xFF) << 16) | v;
@@ -410,12 +421,12 @@ static void info_write16(uint32_t a, uint16_t v)
         else { info_wbuf[o - 0xC0] = (char)(v >> 8); if (o + 1 < 0xE0) info_wbuf[o - 0xC0 + 1] = (char)v; }
         return;
     }
-    /* $ECFFF0 (speed, MHz, 0 = unlimited), $ECFFF2 (write-back 0/1),
-     * $ECFFF4 (JIT 0/1), $ECFFF6 (boot screen 0/1), $ECFFF8 (main RAM MB,
-     * 0 = probe) and $ECFFFA (1 = take the name from $C0) are settings:
+    /* +$F0 (speed, MHz, 0 = unlimited), +$F2 (write-back 0/1), +$F4 (JIT
+     * 0/1), +$F6 (boot screen 0/1), +$F8 (main RAM MB, 0 = probe), +$FA
+     * (1 = take the name from $C0) and +$FC (SMI 0/1) are settings:
      * VMPU68.X writes them, the kernel applies and saves them */
     o &= 0xFE;
-    if (o >= 0xF0 && o <= 0xFA) {
+    if (o >= 0xF0 && o <= 0xFC) {
         unsigned wp = info_cmd_wp;
         if (wp - info_cmd_rp < INFO_CMD_N) {
             info_cmdq[wp % INFO_CMD_N] = (o << 16) | v;
@@ -533,13 +544,16 @@ static void watch_log(uint32_t a, unsigned v, unsigned size, int rd)
 }
 void emu68k_set_watch(uint32_t a, uint32_t len)
 {
-    watch_addr = a & ~1u; watch_end = watch_addr + (len ? len : 2); watch_wp = 0;
+    /* 0xFFFFFFFF = off, kept exact: jit_allowed() compares it (a & ~1 made
+     * every 'ewt 0' leave the JIT off until the next boot) */
+    watch_addr = (a == 0xFFFFFFFFu) ? a : (a & ~1u); watch_end = watch_addr + (len ? len : 2); watch_wp = 0;
     watch_addr2 = 0xFFFFFFFF; watch_end2 = 0xFFFFFFFF;
     watch_frozen = 0;
 }
 void emu68k_set_watch_flags(int noread) { watch_noread = noread; }
-void emu68k_set_watch2(uint32_t a, uint32_t len)   /* adds a second range (ring not reset) */
+void emu68k_set_watch2(uint32_t a, uint32_t len)   /* adds a second range (ring not reset); 0xFFFFFFFF = off */
 {
+    if (a == 0xFFFFFFFFu) { watch_addr2 = 0xFFFFFFFFu; watch_end2 = 0; return; }   /* exact: jit_allowed() compares it */
     watch_addr2 = a & ~1u; watch_end2 = watch_addr2 + (len ? len : 2);
 }
 uint32_t emu68k_watch_count(void) { return watch_wp; }
@@ -901,20 +915,49 @@ void emu68k_crtc_shadow(uint16_t *out, unsigned n)
  * ADPCM at >= 64us per byte) tolerate the deep one */
 #define FDC_PMAX    6
 #define FDC_TAIL_MS 200
+/* ADPCM: the MSM6258 has no buffer - a DMA byte (every 64-128 us) that lands
+ * late is audible (heard as noise in Dracula's music with the deep queue,
+ * clean with 2).  While the DMAC is feeding the ADPCM data port (its writes
+ * show up as snoop records at $E92002/3) keep the queue at ADPCM_PMAX, with a
+ * tail after the last byte.  The CPU's own accesses to the ADPCM ports /
+ * DMAC channel 3 arm it too so the first bytes of a sample are covered. */
+#define ADPCM_TAIL_MS 300
 static unsigned pmax_loose = 48;
-static uint64_t fdc_until;
-static int      fdc_tight;
-void emu68k_set_pmax(unsigned n) { pmax_loose = n; if (!fdc_tight) hw_set_posted_max(n); }
+static unsigned pmax_adpcm = 2;
+static uint64_t fdc_until, adpcm_until;
+static int      fdc_tight, adpcm_tight;
+static void pmax_apply(void)
+{
+    unsigned n = pmax_loose;
+    if (fdc_tight && FDC_PMAX < n) n = FDC_PMAX;
+    if (adpcm_tight && pmax_adpcm < n) n = pmax_adpcm;
+    hw_set_posted_max(n);
+}
+void emu68k_set_pmax(unsigned n) { pmax_loose = n; pmax_apply(); }
+void emu68k_set_pmax_adpcm(unsigned n) { pmax_adpcm = n; pmax_apply(); }
+unsigned emu68k_pmax_adpcm(void) { return pmax_adpcm; }
+unsigned emu68k_pmax_loose(void) { return pmax_loose; }
 int  emu68k_fdc_tight(void) { return fdc_tight; }
+int  emu68k_adpcm_tight(void) { return adpcm_tight; }
+static inline void adpcm_touch(void)
+{
+    adpcm_until = vmpu68_ticks() + (uint64_t)ADPCM_TAIL_MS * vmpu68_tick_hz() / 1000;
+    if (!adpcm_tight) { adpcm_tight = 1; pmax_apply(); }
+}
 static inline void fdc_touch(uint32_t a)
 {
+    if ((a & 0xFFFFFC) == 0xE92000 || (a & 0xFFFFC0) == 0xE840C0) { adpcm_touch(); return; }
     if ((a & 0xFFFFC0) != 0xE84000 && (a & 0xFFFFFC) != 0xE94000) return;
     fdc_until = vmpu68_ticks() + (uint64_t)FDC_TAIL_MS * vmpu68_tick_hz() / 1000;
-    if (!fdc_tight) { fdc_tight = 1; hw_set_posted_max(FDC_PMAX); }
+    if (!fdc_tight) { fdc_tight = 1; pmax_apply(); }
 }
 static inline void fdc_expire(void)
 {
-    if (fdc_tight && vmpu68_ticks() > fdc_until) { fdc_tight = 0; hw_set_posted_max(pmax_loose); }
+    uint64_t now = vmpu68_ticks();
+    int changed = 0;
+    if (fdc_tight && now > fdc_until) { fdc_tight = 0; changed = 1; }
+    if (adpcm_tight && now > adpcm_until) { adpcm_tight = 0; changed = 1; }
+    if (changed) pmax_apply();
 }
 /* for the Web server (core 0): the FDC or DMAC channel 0 was touched within
  * the last FDC_TAIL_MS, so a floppy transfer may be running.  Read-only -
@@ -1224,7 +1267,7 @@ void m68k_write_memory_8(unsigned int a, unsigned int v)
         }
         break;
     }
-    if (io_write(a, 0, (uint16_t)(v & 0xFF)) & VST_FAULT) bus_fault();
+    if (io_write(a, 0, (uint16_t)(v & 0xFF)) & VST_FAULT) bus_fault_w();
 }
 
 void m68k_write_memory_16(unsigned int a, unsigned int v)
@@ -1259,7 +1302,7 @@ void m68k_write_memory_16(unsigned int a, unsigned int v)
         if (xt30_hit(a)) { xt30_write(v & 0xFFFF); return; }
         break;
     }
-    if (io_write(a, 1, (uint16_t)v) & VST_FAULT) bus_fault();
+    if (io_write(a, 1, (uint16_t)v) & VST_FAULT) bus_fault_w();
 }
 
 void m68k_write_memory_32(unsigned int a, unsigned int v)
@@ -1610,6 +1653,7 @@ static uint32_t rep_lo, rep_hi;     /* range waiting to be re-read (rng_pending,
 
 static void sn_apply(const vmpu68_snoop_t *r)
 {
+    if ((r->addr & 0xFFFFFC) == 0xE92000) adpcm_touch();   /* the DMAC feeding the ADPCM: keep the queue shallow */
     if (snlog) {
         snlog_t *e = &snlog[snlog_wp++ & (SNLOG_N - 1)];
         e->seq = evseq++; e->addr = r->addr & ~1u; e->data = r->data;

@@ -28,6 +28,7 @@ void vmpu68_apply_settings (int mhz, int wb, int jit, boolean save);   // -1 = l
 unsigned vmpu68_mhz_limit (void);
 const char *vmpu68_hw_rev (void);
 int  vmpu68_sramboot_set (int on, boolean save);   // install/remove the SRAM boot program (X68030-style boot screen); 0 = ok (kernel.cpp)
+int  vmpu68_smi_set (int on, boolean save);        // SMI transport on core 2.x (Web UI / VMPU68.X -t): 0 ok, -1 not this board, -2 FPGA did not answer (kernel.cpp)
 int  vmpu68_sramboot_state (void);                 // 1 installed and current, 0 absent, 2 another SRAM program, -1 no bus   // board revision for the LAN ("1.0", "2.1"; vmpu68.cfg hw= overrides) (kernel.cpp)   // status LED: every colour blinks 4 Hz for ms ("find me")
 
 // package install: parameters set by the requester, progress published by

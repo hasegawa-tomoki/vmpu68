@@ -7,10 +7,11 @@ static char s_Name[CFG_NAME_MAX] = "";
 static unsigned s_RamMB;                // ram=<MB>, 0 = auto
 static unsigned s_MHz;                  // mhz=<n>, 0 = unlimited
 static unsigned s_WB = 1;               // wb=<0|1>, default write-back
-static unsigned s_JIT = 0;              // jit=<0|1>, default off
+static unsigned s_JIT = 1;              // jit=<0|1>, default on (1.1.0; was off)
 static unsigned s_SramBoot = 0;         // sramboot=<0|1>, default off
 static char s_HW[12] = "";             // hw=<rev>, e.g. 2.1; empty = from the board profile
 static unsigned s_Board;                // board=<1|2> GPIO layout, 0 = auto
+static unsigned s_SMI = 1;              // smi=<0|1>: SMI register transport on core 2.x
 
 static void set_name (const char *v)
 {
@@ -30,6 +31,8 @@ void cfg_load (void)
     s_MHz = 0;
     s_WB = 1;
     s_Board = 0;
+    s_SMI = 1;
+    s_JIT = 1;
     FIL f;
     if (f_open (&f, CFG_FILE, FA_READ) != FR_OK)
         return;
@@ -71,6 +74,8 @@ void cfg_load (void)
         }
         else if (strncmp (p, "board=", 6) == 0)
             s_Board = (p[6] == '1' || p[6] == '2') ? (unsigned) (p[6] - '0') : 0;
+        else if (strncmp (p, "smi=", 4) == 0)
+            s_SMI = p[4] == '0' ? 0 : 1;
         // unknown keys are ignored (forward compatible)
     }
     f_close (&f);
@@ -82,12 +87,14 @@ unsigned cfg_sramboot (void) { return s_SramBoot; }
 void cfg_set_sramboot (unsigned on) { s_SramBoot = on ? 1 : 0; }
 const char *cfg_hw (void) { return s_HW; }
 unsigned cfg_board (void) { return s_Board; }
+unsigned cfg_smi (void) { return s_SMI; }
+void cfg_set_smi (unsigned on) { s_SMI = on ? 1 : 0; }
 void cfg_set_board (unsigned id) { s_Board = (id == 1 || id == 2) ? id : 0; }
 void cfg_set (unsigned mhz, unsigned wb, unsigned jit) { s_MHz = mhz <= 1000 ? mhz : 0; s_WB = wb ? 1 : 0; s_JIT = jit ? 1 : 0; }
 void cfg_set_name (const char *v) { set_name (v); }
 void cfg_set_ram (unsigned mb) { s_RamMB = mb <= 12 ? mb : 0; }
 
-// Rewrite the file: lines with the keys we own (name=, ram=, mhz=, wb=, jit=, sramboot=, board=)
+// Rewrite the file: lines with the keys we own (name=, ram=, mhz=, wb=, jit=, sramboot=, board=, smi=)
 // are replaced, everything else (comments, hw=, unknown keys) is kept as it was.
 int cfg_save (void)
 {
@@ -100,7 +107,7 @@ int cfg_save (void)
         {
             const char *p = line; while (*p == ' ' || *p == '\t') p++;
             if (strncmp (p, "mhz=", 4) == 0 || strncmp (p, "wb=", 3) == 0 || strncmp (p, "jit=", 4) == 0 || strncmp (p, "sramboot=", 9) == 0 || strncmp (p, "board=", 6) == 0
-             || strncmp (p, "name=", 5) == 0 || strncmp (p, "ram=", 4) == 0) continue;
+             || strncmp (p, "name=", 5) == 0 || strncmp (p, "ram=", 4) == 0 || strncmp (p, "smi=", 4) == 0) continue;
             unsigned n = 0; while (line[n] && line[n] != '\r' && line[n] != '\n') n++;
             memcpy (keep[nk], line, n); keep[nk][n] = 0; nk++;
         }
@@ -124,6 +131,7 @@ int cfg_save (void)
     a = "jit="; while (*a) tail[n++] = *a++; tail[n++] = (char) ('0' + s_JIT); tail[n++] = '\n';
     a = "sramboot="; while (*a) tail[n++] = *a++; tail[n++] = (char) ('0' + s_SramBoot); tail[n++] = '\n';
     if (s_Board) { a = "board="; while (*a) tail[n++] = *a++; tail[n++] = (char) ('0' + s_Board); tail[n++] = '\n'; }
+    if (!s_SMI)  { a = "smi=0\n"; while (*a) tail[n++] = *a++; }
     ok = ok && f_write (&f, tail, n, &bw) == FR_OK;
     f_sync (&f); f_close (&f);
     return ok ? 0 : -1;

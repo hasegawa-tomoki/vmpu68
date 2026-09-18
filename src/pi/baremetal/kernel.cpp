@@ -32,6 +32,7 @@ extern "C" {
 #include "sramboot_bin.h"
 #endif
 void vmpu68_set_gpio_base(volatile unsigned int *base);
+void vmpu68_set_smi_base(volatile unsigned int *smi_base, volatile unsigned int *cm_base);
 void vmpu68_pace_bench(unsigned n);
 }
 
@@ -42,6 +43,8 @@ static boolean s_emu_inited;
 static volatile boolean  s_emu_run;            // erun: free-running emulator (core 1)
 static volatile boolean  s_auto = TRUE;        // supervise X68000 power/reset and run automatically
 static boolean           s_x68_on;             // PLL locked = X68000 clock present
+static boolean           s_fpga_frozen;        // FPGA answers but its clock is stopped (2.x with the X68000 off): waiting, not re-initialising
+
 // X68000 supervision state (main loop; here so that "auto" can show it)
 static struct {
     unsigned nLastSup, nRuns;
@@ -296,6 +299,19 @@ unsigned vmpu68_emu_type (const char *p, int enter, unsigned *pDropped)
 
 static const char FromKernel[] = "vmpu68";
 
+// SMI register transport (core 2.x): vmpu68.cfg smi= (default 1).  Called
+// after every successful hw_init(): the FPGA probe re-opens the pins as GPIO.
+static void apply_smi_cfg (void)
+{
+    if (hw_is_mock () || vmpu68_board_id () != 2) return;
+    int want = cfg_smi () ? 1 : 0;
+    if (want == hw_smi ()) return;
+    int r = hw_set_smi (want);
+    if (want)
+        CLogger::Get ()->Write (FromKernel, LogNotice, r == 0 ? "hw: SMI register transport on (smi=1)"
+                                                    : "hw: SMI transport unavailable (%d) - GPIO strobes", r);
+}
+
 // firmware mailbox tag: pass reboot flags to the bootloader; bit0 = tryboot
 // (load tryboot.txt / the try kernel on the next boot only).  Writing the
 // PM_RSTS partition bits does NOT work on Pi 4 — the firmware does not
@@ -397,7 +413,7 @@ static void PanicFlush (void)
     }
     PanicPuts (base, "[panic] end\n");
 }
-// VMPU68 information port ($ECFF00): refresh the record the X68000 side
+// VMPU68 information port ($ECD000): refresh the record the X68000 side
 // reads (VMPU68.X shows it).  Big-endian, see emu68k.c.
 const cfg_bus_class *vmpu68_bus_class (void);   // defined below
 static unsigned s_equiv_mhz10;                 // 68000-equivalent MHz x10 over the last second
@@ -438,6 +454,7 @@ static void info_update (void)
     put16 (rec + 0xF4, jit_enabled () ? 1 : 0);
     put16 (rec + 0xF6, cfg_sramboot () ? 1 : 0);
     put16 (rec + 0xF8, cfg_ram_mb ());
+    put16 (rec + 0xFC, vmpu68_board_id () == 2 ? (hw_smi () ? 1 : 0) : 2);   // SMI transport: 0/1, 2 = not on this board (1.x)
     emu68k_info_set (rec, sizeof rec);
 }
 unsigned vmpu68_equiv_mhz10 (void) { return s_equiv_mhz10; }
@@ -482,6 +499,19 @@ static int sramboot_install (int on)
     }
     return (int) bad;
 }
+// SMI transport (Web UI / API): switch like the console 'smi' with the core paused; core 2.x only.
+// 0 = ok, -1 = not this board, -2 = the FPGA did not answer through SMI (reverted)
+int vmpu68_smi_set (int on, boolean save)
+{
+    if (hw_is_mock () || vmpu68_board_id () != 2) return -1;
+    emu_quiesce ();
+    int r = hw_set_smi (on ? 1 : 0);
+    if (r == 0 && save) { cfg_set_smi (on ? 1 : 0); cfg_save (); }
+    s_emu_run = TRUE; DataSyncBarrier ();
+    CLogger::Get ()->Write (FromKernel, LogNotice, "cfg: smi=%u (Web)%s", on ? 1 : 0, r ? " - switch FAILED" : "");
+    return r;
+}
+
 int vmpu68_sramboot_set (int on, boolean save)
 {
     int rc = -1;
@@ -503,7 +533,7 @@ int vmpu68_sramboot_set (int on, boolean save)
 const char *vmpu68_hw_rev (void)
 {
     if (cfg_hw ()[0]) return cfg_hw ();
-    return vmpu68_board_id () == 1 ? "1.0" : "2.0";
+    return vmpu68_board_id () == 1 ? "1.0" : "2.0.1";   // the built 2.x boards are 2.0.1; 2.1 (PSRAM) is not detectable yet: hw=2.1 in vmpu68.cfg
 }
 
 // Runtime settings (Web UI /api/config, VMPU68.X through the information
@@ -563,6 +593,7 @@ boolean CKernel::Initialize (void)
     // through both layouts (a configured FPGA answers 0x56 on either
     // board); a blank FPGA (new board) leaves nothing to probe -> 2.x
     vmpu68_set_gpio_base ((volatile unsigned int *) ARM_GPIO_BASE);
+    vmpu68_set_smi_base ((volatile unsigned int *) (ARM_IO_BASE + 0x600000), (volatile unsigned int *) (ARM_IO_BASE + 0x101000));
     const char *how = "vmpu68.cfg";
     int board = (int) cfg_board ();
     if (!board) { board = vmpu68_probe_board (); how = board ? "probed" : "default"; }
@@ -581,7 +612,7 @@ boolean CKernel::Initialize (void)
     s_emu_mhz = cfg_mhz ();             // emulated clock limit (0 = unlimited), like the console espd
     emu68k_set_pace_mhz (s_emu_mhz);
     emu68k_wb_set (cfg_wb ());          // main RAM write-back (wb=, default on)
-    jit_set_enabled (cfg_jit ());       // execution by translation (jit=, default off)
+    jit_set_enabled (cfg_jit ());       // execution by translation (jit=, default on since 1.1.0)
 
     // Wi-Fi is brought up later, from the main loop (StartWLAN): the
     // firmware download takes 6-7 s and used to sit here in front of the
@@ -715,7 +746,6 @@ static unsigned s_fpga_us = 10;                // flash bit-bang pace (us/phase)
 // returns: 0 none, 1 reboot, 2 receive file of s_xfer_len into s_xfer_path,
 //          3 receive s_xfer_len bytes into emulator memory at s_xfer_addr
 static u32 file_sum_range (FIL *f, u32 off, u32 len, boolean *pOK);   // fwd (defined below)
-static void smi_experiment (put_fn out, void *ctx, unsigned divi, unsigned strobe, unsigned setup, unsigned hold, unsigned n);   // fwd
 
 // ---------------- A/B boot: tryboot promote / roll back ----------------
 // config.txt boots kernel8-rpi4.img (stable); tryboot.txt boots
@@ -940,6 +970,7 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
     else if (p[0] == 'h' && p[1] == 'w' && p[2] == 'p')    // hwp: re-probe the FPGA register file
     {
         int mock = hw_init ();
+        apply_smi_cfg ();
         R.Format ("hwp: FPGA %s\r\n", mock ? "NOT detected (mock)" : "detected (sig 0x56)");
     }
     else if (p[0] == 'c' && p[1] == 'r' && p[2] == 's')    // crst: pulse CRESET_B (reconfigure)
@@ -950,6 +981,7 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         vmpu68_flash_end ();
         CTimer::SimpleusDelay (1500000);
         int mock = hw_init ();
+        apply_smi_cfg ();
         R.Format ("crst: FPGA %s\r\n", mock ? "NOT detected" : "detected (sig 0x56)");
     }
     else if (p[0] == 'b' && p[1] == 'e' && p[2] == 'n')    // bench [wbase]: GPIO/bus micro-benchmarks (writes to wbase, default E00000)
@@ -1265,12 +1297,14 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         vmpu68_emu_pause (0);
         R.Format ("paused %u ms\r\n", ms);
     }
-    else if (p[0] == 'p' && p[1] == 'm')                   // pmax [n]: outstanding posted writes before a drain
+    else if (p[0] == 'p' && p[1] == 'm')                   // pmax [n] [adpcm]: outstanding posted writes before a drain (loose / while the ADPCM DMA runs)
     {
         p += 4;
-        unsigned n = parse_num (p);
+        unsigned n = parse_num (p), a = parse_num (p);
         if (n) emu68k_set_pmax (n);
-        R.Format ("posted max %u (fdc %s)\r\n", hw_set_posted_max (0), emu68k_fdc_tight () ? "tight" : "idle");
+        if (a) emu68k_set_pmax_adpcm (a);
+        R.Format ("posted max %u now (loose %u, adpcm %u; fdc %s, adpcm %s)\r\n", hw_set_posted_max (0), emu68k_pmax_loose (), emu68k_pmax_adpcm (),
+                  emu68k_fdc_tight () ? "tight" : "idle", emu68k_adpcm_tight () ? "tight" : "idle");
     }
     else if (p[0] == 'p' && p[1] == 'f')                   // pf [0|1]: prefetch stream on/off; shows and clears the counters
     {
@@ -1849,7 +1883,7 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         unsigned len2 = parse_num (p);
         emu_ensure ();
         emu68k_set_watch (a ? a : 0xFFFFFFFF, len);
-        if (a2) emu68k_set_watch2 (a2, len2);
+        if (a2 || !a) emu68k_set_watch2 (a2 ? a2 : 0xFFFFFFFF, len2);   // ewt 0 clears both ranges (a live range keeps the JIT off: jit_allowed)
         R.Format ("watch %s %06X len %u%s\r\n", a ? "at" : "off", a, len ? len : 2, a2 ? " (+2nd range)" : "");
     }
     else if (p[0] == 'e' && p[1] == 'w' && p[2] == 'f')    // ewf <0|1>: 1 = the watch records writes only
@@ -2151,18 +2185,62 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         else if (p[2] == 'x')                  // abx: discard the try kernel (roll back intent)
         { s_ab_arm_promote = 0; f_unlink (AB_MARKER); f_unlink (AB_TRY); R.Append ("  -> try slot discarded\r\n"); }
     }
-    else if (p[0] == 's' && p[1] == 'm' && p[2] == 'i')    // smi [divi strobe setup hold n]: SMI bring-up + write-strobe train (experiment; reboots the bus)
+    else if (p[0] == 's' && p[1] == 'm' && p[2] == 'i' && p[3] == 'f')    // smif <flags>: SMI transport experiments (bit0 cache SMIDA, bit1 no DONE clear); re-verifies the FPGA answer
     {
-        p += 3;
-        unsigned divi = parse_num (p), strobe = parse_num (p), setup = parse_num (p), hold = parse_num (p), n = parse_num (p);
+        p += 4;
+        unsigned f = parse_num (p);
 #ifdef VMPU68_WITH_EMU
         emu_quiesce ();
 #endif
-        out (ctx, "SMI experiment: taking over the AD pins, FPGA held in reset (reboot afterwards)\r\n");
-        smi_experiment (out, ctx, divi, strobe, setup, hold, n);
-        R = "";
+        int was = hw_smi ();
+        if (was) hw_set_smi (0);
+        vmpu68_smi_flags (f);
+        int r = was ? hw_set_smi (1) : 0;
+        R.Format ("smi flags %u: %s\r\n", vmpu68_smi_get_flags (), r == 0 ? (was ? "on, FPGA answers" : "set (SMI off)") : "the FPGA did not answer - back to GPIO");
     }
-    else if (p[0] == 'i' && p[1] == 'n' && p[2] == 'f' && p[3] == 'o')    // info: $ECFF00 record as the X68000 sees it
+    else if (p[0] == 's' && p[1] == 'm' && p[2] == 'i' && p[3] == 'd')    // smid <ns>: spin before the first DONE poll of an SMI read
+    {
+        p += 4;
+        vmpu68_smi_rdelay (parse_num (p));
+        R.Format ("smi read delay %u ns\r\n", vmpu68_smi_get_rdelay ());
+    }
+    else if (p[0] == 's' && p[1] == 'm' && p[2] == 'i' && p[3] == 'b')    // smib: SMI MMIO micro-benchmark
+    {
+#ifdef VMPU68_WITH_EMU
+        emu_quiesce ();
+#endif
+        uint32_t b[5]; vmpu68_smi_bench (b); vmpu68_ctrl_invalidate ();
+        R.Format ("smi bench (ns/op): DCS read %u  DA write %u  reg write %u  reg read %u  GPLEV read %u\r\n", b[0], b[1], b[2], b[3], b[4]);
+    }
+    else if (p[0] == 's' && p[1] == 'm' && p[2] == 'i')    // smi [0|1] [div ws wst wh rs rst rh pace]: SMI register transport (core 2.x); stops the emulator
+    {
+        p += 3;
+        while (*p == ' ') p++;
+        if (*p >= '0' && *p <= '9')
+        {
+            int on = parse_num (p) ? 1 : 0;
+            unsigned t[8]; for (unsigned i = 0; i < 8; i++) t[i] = parse_num (p);
+#ifdef VMPU68_WITH_EMU
+            emu_quiesce ();
+#endif
+            if (hw_smi ()) hw_set_smi (0);         // re-apply the timing from scratch
+            vmpu68_smi_timing (t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+            int r = hw_set_smi (on);
+            if (r == -1) out (ctx, "smi: not available (core 1.x layout or no SMI base)\r\n");
+            if (r == -2) out (ctx, "smi: the FPGA did not answer through SMI - back to GPIO\r\n");
+            if (r == 0 && vmpu68_board_id () == 2 && (unsigned) on != cfg_smi ())
+            {
+                cfg_set_smi ((unsigned) on);
+                out (ctx, cfg_save () == 0 ? "smi: saved to vmpu68.cfg\r\n" : "smi: cfg SAVE FAILED\r\n");
+            }
+        }
+        unsigned t[8]; vmpu68_smi_get (t);
+        uint32_t st[4]; vmpu68_smi_stats (st, 0);
+        unsigned khz = 750000 / t[0];
+        R.Format ("smi: %s  clock PLLD/%u = %u.%03u MHz  write setup/strobe/hold %u/%u/%u  read %u/%u/%u  pace %u  (writes %u reads %u timeouts %u)\r\n",
+                  hw_smi () ? "on" : "off (GPIO)", t[0], khz / 1000, khz % 1000, t[1], t[2], t[3], t[4], t[5], t[6], t[7], st[0], st[1], st[2]);
+    }
+    else if (p[0] == 'i' && p[1] == 'n' && p[2] == 'f' && p[3] == 'o')    // info: $ECD000 record as the X68000 sees it
     {
         info_update ();
         R.Format ("equiv %u.%u MHz (68000 cycles/us over the last second), bus %u.%u MHz, ram %u MB\r\n",
@@ -2904,66 +2982,6 @@ boolean CKernel::Update (CDevice *pDev, const char *pPath, boolean bTry, boolean
 #define GP_LEV0 (ARM_GPIO_BASE + 0x34)
 
 
-// ---------------- SMI (Secondary Memory Interface) experiment ----------------
-// SMI is the SoC's parallel-bus engine (address SAx, strobes SOE/SWE, data
-// SDx, DMA-fed, ns-programmable timing).  Fits a register bus, but its pins
-// are fixed (ALT1) and do NOT match this board - a board 1.1 re-route is
-// needed to run the real bus (docs/design/smi-plan.md).  Here we bring SMI
-// up and emit a write-strobe train for a scope.  Destructive: it takes over
-// the AD pins and holds the FPGA in reset, so reboot afterwards.
-#define SMI_BASE   (ARM_IO_BASE + 0x600000)
-#define SMICS_R    (SMI_BASE + 0x00)
-#define SMIDSW0_R  (SMI_BASE + 0x14)
-#define SMIDCS_R   (SMI_BASE + 0x34)
-#define SMIDA_R    (SMI_BASE + 0x38)
-#define SMIDD_R    (SMI_BASE + 0x3c)
-#define CM_SMICTL  (ARM_IO_BASE + 0x1010b0)
-#define CM_SMIDIV  (ARM_IO_BASE + 0x1010b4)
-#define CM_PWD     (0x5au << 24)
-static void smi_set_fsel (unsigned pin, unsigned mode)
-{
-    unsigned reg = ARM_GPIO_BASE + (pin / 10) * 4, sh = (pin % 10) * 3;
-    unsigned v = read32 (reg); v &= ~(7u << sh); v |= (mode & 7) << sh; write32 (reg, v);
-}
-static void smi_experiment (put_fn out, void *ctx, unsigned divi, unsigned strobe, unsigned setup, unsigned hold, unsigned n)
-{
-    if (!divi) divi = 1; if (!strobe) strobe = 2; if (!setup) setup = 1; if (!hold) hold = 1; if (!n) n = 200000;
-    CString R;
-    smi_set_fsel (vmpu68_board ()->creset, 1); write32 (GP_CLR0, 1u << vmpu68_board ()->creset);
-    CTimer::SimpleusDelay (1000);
-    write32 (CM_SMICTL, CM_PWD | (1u << 5));
-    CTimer::SimpleusDelay (10);
-    write32 (CM_SMIDIV, CM_PWD | ((divi & 0xfff) << 12));
-    write32 (CM_SMICTL, CM_PWD | 1u);
-    CTimer::SimpleusDelay (10);
-    write32 (CM_SMICTL, CM_PWD | (1u << 4) | 1u);
-    for (unsigned i = 0; i < 1000 && !(read32 (CM_SMICTL) & (1u << 7)); i++) CTimer::SimpleusDelay (1);
-    smi_set_fsel (5, 5); smi_set_fsel (6, 5); smi_set_fsel (7, 5);
-    for (unsigned g = 8; g <= 13; g++) smi_set_fsel (g, 5);   // SD0-5 only: keep GPIO14/15 as the serial console
-    unsigned dsw = (1u << 30) | ((setup & 0x3f) << 24) | ((hold & 0x3f) << 16) | ((1u & 0x7f) << 8) | (strobe & 0x7f);
-    write32 (SMIDSW0_R, dsw);
-    write32 (SMICS_R, 0);
-    write32 (SMIDA_R, 0);
-    unsigned cyc = setup + strobe + hold + 1;
-    unsigned clk_khz = 19200 / divi;
-    R.Format ("SMI clk %u.%03u MHz (osc/%u), write cycle = setup %u + strobe %u + hold %u + pace 1 = %u cyc = %u ns\r\n",
-              clk_khz / 1000, clk_khz % 1000, divi, setup, strobe, hold, cyc, (cyc * 1000000u + clk_khz / 2) / clk_khz);
-    out (ctx, (const char *) R);
-    R.Format ("SMIDSW0=%08X  emitting %u writes on SWE=GPIO7, SD0..5=GPIO8..13 ...\r\n", dsw, n); out (ctx, (const char *) R);
-    unsigned t0 = CTimer::GetClockTicks ();
-    for (unsigned i = 0; i < n; i++)
-    {
-        write32 (SMIDCS_R, (1u << 3) | (1u << 1) | 1u);
-        write32 (SMIDD_R, (u16) (i & 0xffff));
-        unsigned g = 0; while (!(read32 (SMIDCS_R) & (1u << 2)) && ++g < 100000) ;
-        write32 (SMIDCS_R, (1u << 2));
-    }
-    unsigned dt = CTimer::GetClockTicks () - t0;
-    R.Format ("done: %u writes in %u us = %u ns/write (CPU-paced direct mode; DMA would be faster)\r\n",
-              n, dt, n ? (unsigned) ((unsigned long long) dt * 1000 / n) : 0); out (ctx, (const char *) R);
-    out (ctx, "SMI pins ALT1, FPGA held in reset - reboot to restore the bus.\r\n");
-}
-
 static void sspi_xfer (const u8 *tx, u8 *rx, unsigned n, unsigned us)
 {
     write32 (GP_CLR0, 1u << vmpu68_board ()->ss);
@@ -3341,6 +3359,7 @@ TShutdownMode CKernel::Run (void)
     int mock = hw_init ();
     CLogger::Get ()->Write (FromKernel, LogNotice, "hw: %s backend",
                     mock ? "MOCK (no FPGA answer)" : "FPGA");
+    apply_smi_cfg ();
     vmpu68_set_snoop_hook_core (1);            // the snoop hook writes the shadow: emulator core only
     hw_wq_enable (0);                          // core-2 write queue off by default since 0.1.18 (docs 31: latency for raster/timer IRQ handlers); 'wq 1' turns it on for experiments
 #ifdef VMPU68_WITH_EMU
@@ -3401,7 +3420,7 @@ TShutdownMode CKernel::Run (void)
             }
         }
 
-        info_update ();                        // $ECFF00 information port (once a second)
+        info_update ();                        // $ECD000 information port (once a second)
         {
             unsigned off, val;                 // VMPU68.X wrote a setting into the information port
             while (emu68k_info_take_cmd (&off, &val))   // VMPU68.X may queue several settings at once
@@ -3412,6 +3431,7 @@ TShutdownMode CKernel::Run (void)
                 else if (off == 0xF6) vmpu68_sramboot_set (val ? 1 : 0, TRUE);
                 else if (off == 0xF8) { cfg_set_ram (val); cfg_save (); CLogger::Get ()->Write (FromKernel, LogNotice, "cfg: ram=%u (VMPU68.X, applies at the next boot)", cfg_ram_mb ()); }
                 else if (off == 0xFA) { cfg_set_name (emu68k_info_name ()); cfg_save (); CLogger::Get ()->Write (FromKernel, LogNotice, "cfg: name=\"%s\" (VMPU68.X)", cfg_name ()); }
+                else if (off == 0xFC) vmpu68_smi_set (val ? 1 : 0, TRUE);   // SMI transport (VMPU68.X -t)
             }
         }
         s_led_booted = TRUE;
@@ -3537,22 +3557,48 @@ TShutdownMode CKernel::Run (void)
                     if (hw_init () == 0)
                     {
                         CLogger::Get ()->Write (FromKernel, LogNotice, "hw: FPGA detected late - leaving mock mode");
+                        apply_smi_cfg ();
                         hw_wq_enable (1);
                     }
                 }
             }
             else if (hw_alive () < 0)
             {
-                // the FPGA was reloaded behind our back (X68000 power cycle):
-                // its registers are at power-up values, the emulator's state is
-                // meaningless.  Re-program, and let the supervision below boot
-                // again as if the machine had just been switched on.
-                CLogger::Get ()->Write (FromKernel, LogNotice, "hw: FPGA reconfigured (X68000 power cycle?) - re-initialising");
-                emu_quiesce ();
-                hw_reinit ();
-                s_x68_on = FALSE;
-                bEverDead = FALSE; bWasAlive = FALSE; // a reconfiguration is a real power cycle
+                if (!(hw_reg_read (2) & VDIAG_PLL_LOCK))
+                {
+                    // core 2.x: the FPGA is powered from the Pi, so with the
+                    // X68000 off (or the board on the bench) it answers with
+                    // its signature but its clock - the PLL fed by the bus
+                    // clock - is stopped.  Nothing can latch the hello marker
+                    // then, so "no hello" means "no clock", not a
+                    // reconfiguration; re-initialising would only be lost
+                    // again.  Say so once and wait for the clock: the
+                    // power-on path below re-programs the registers.
+                    if (!s_fpga_frozen)
+                    {
+                        s_fpga_frozen = TRUE;
+                        CLogger::Get ()->Write (FromKernel, LogNotice, "hw: FPGA present but X68000 clock stopped (machine off?) - waiting");
+                        if (s_x68_on) { s_x68_on = FALSE; emu_quiesce (); }
+                    }
+                }
+                else
+                {
+                    // the FPGA was reloaded behind our back (X68000 power cycle),
+                    // or (2.x) its clock came back after a stop: the registers
+                    // are at power-up values or our writes were lost, the
+                    // emulator's state is meaningless.  Re-program, and let the
+                    // supervision below boot again as if the machine had just
+                    // been switched on.
+                    CLogger::Get ()->Write (FromKernel, LogNotice, s_fpga_frozen ? "hw: X68000 clock back - re-initialising the FPGA"
+                                                                                  : "hw: FPGA reconfigured (X68000 power cycle?) - re-initialising");
+                    s_fpga_frozen = FALSE;
+                    emu_quiesce ();
+                    hw_reinit ();
+                    s_x68_on = FALSE;
+                    bEverDead = FALSE; bWasAlive = FALSE; // a reconfiguration is a real power cycle
+                }
             }
+            else s_fpga_frozen = FALSE;
         }
         // the reset button: the machine's reset circuit asserts RESET_IN and
         // HALT_IN for only ~25 us (measured on an XVI) - enough for a real

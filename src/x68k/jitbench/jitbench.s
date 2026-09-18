@@ -1,6 +1,6 @@
 ; jitbench.s: JIT の効果測定用ベンチマーク(Human68k、X 形式、PC 相対のみ)
-;   4 つのカーネルを走らせ、情報ポート($ECFF04/06)の µs カウンタで計時して表示する。
-;   結果は $ECFF80〜 にも書く(コンソール info の書込みログで読める)。
+;   4 つのカーネルを走らせ、情報ポート($ECD004/06)の µs カウンタで計時して表示する。
+;   結果は $ECD080〜 にも書く(コンソール info の書込みログで読める)。
                 clr.l   -(sp)
                 dc.w    $FF20           ; _SUPER (I/O 領域のため)
                 addq.l  #4,sp
@@ -106,7 +106,7 @@
                 bsr     print_us
 
 ; ---- 結果を情報ポートへ(ms 単位、16 ビット) ----
-                lea     $ECFF80,a0
+                lea     $ECD080,a0
                 move.l  r_alu(pc),d0
                 bsr     to_ms
                 move.w  d0,(a0)+
@@ -129,9 +129,9 @@ sub3:           add.l   d1,d1
                 rts
 
 ; µs カウンタ読み: d0 = 32 ビット µs
-tick:           move.w  $ECFF04,d0
+tick:           move.w  $ECD004,d0
                 swap    d0
-                move.w  $ECFF06,d0
+                move.w  $ECD006,d0
                 rts
 
 ; d0 = µs → d0 = ms(切り捨て、16 ビット)

@@ -50,6 +50,10 @@ int      emu68k_slow_get(uint32_t back, emu68k_slow_t *e);
 void     emu68k_slow_freeze(int on);
 void     emu68k_set_pmax(unsigned n);   /* posted-write depth outside FDC use (see FDC_PMAX) */
 int      emu68k_fdc_tight(void);
+int      emu68k_adpcm_tight(void);        /* the DMAC is feeding the ADPCM: posted queue at the ADPCM depth */
+void     emu68k_set_pmax_adpcm(unsigned n);
+unsigned emu68k_pmax_adpcm(void);
+unsigned emu68k_pmax_loose(void);
 int      emu68k_fdc_busy(void);
 extern int iack_log_all;           /* eiq logs every level, not just 1-4 (diagnostics) */    /* FDC/DMAC ch0 touched within FDC_TAIL_MS: a floppy transfer may be running */
 uint32_t emu68k_iack_count(void);      /* IACK history: {vec[15:8], result[5:4], level[2:0]} */
@@ -127,8 +131,8 @@ int  emu68k_cpu30(void);              /* 1 while the 68030 is selected */
 void emu68k_set_io_mhz(unsigned mhz, unsigned max_cyc);   /* max_cyc 0 = default cap */
 unsigned emu68k_io_mhz(void);
 void emu68k_info_set(const void *p, unsigned len);
-const char *emu68k_info_name(void);   /* text VMPU68.X wrote to $ECFFC0-$ECFFDF (host name), NUL-terminated */
-int  emu68k_info_take_cmd(unsigned *off, unsigned *val);   /* a setting written to $ECFFF0/$ECFFF2 by the X68000 (once) */
+const char *emu68k_info_name(void);   /* text VMPU68.X wrote to the port's +$C0-$DF (host name), NUL-terminated */
+int  emu68k_info_take_cmd(unsigned *off, unsigned *val);   /* a setting written to the port's +$F0.. by the X68000 (once) */
 uint32_t emu68k_info_wlog(uint32_t back, uint32_t *entry);   /* writes to the port: {offset<<16 | value}, back=0 newest; returns total */   /* $ECFF00 information port record (<= 256 bytes) */
 void emu68k_crtc_shadow(uint16_t *out, unsigned n);   /* CRTC R0.. as written by the 68000 (write-only on the hardware) */
 unsigned emu68k_io_max_cyc(void);

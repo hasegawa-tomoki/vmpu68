@@ -8,7 +8,7 @@
 ;   1 行目の小さな大文字は ROM の合成字形: $F2xx を印字すると IOCS(_FNTADR)が下位バイトの 8x8 ANK
 ;   フォントをセルの下半分に置く(030_omake と同じ見た目。$F0xx なら上半分)。外字定義は不要。
 ;
-;   情報は基板側の情報ポート($ECFF00〜$ECFFFF、emu68k.c 参照)から読む。
+;   情報は基板側の情報ポート($ECD000〜$ECD0FF、emu68k.c 参照。1.0.0 は $ECFF00 で、X 版はそちらも探す)から読む。
 ;     +0  'VMPU'            +4  us カウンタ(32 ビット。+4 を読むとラッチ、+6 が下位ワード)
 ;     +8  換算 MHz x10(基板側計測)   +10 バス MHz x10   +12 RAM MB   +14 フラグ
 ;     +16 版数(16)   +32 ビルド(32)   +64 自由テキスト(192)
@@ -27,7 +27,16 @@ LINEBUF         macro
                 endc
                 endm
 
-INFO            equ     $ECFF00
+INFO            equ     $ECD000         ; 情報ポート(1.0.1〜。拡張 I/O のスロット D 先頭 256 バイト)
+INFO_OLD        equ     $ECFF00         ; 1.0.0 のカーネルの番地(FineScanner-X68 スロット F / BANK RAM ボードと重なるため移動)
+; LEAINFO \1: 情報ポートの番地を \1 へ。X 版は build_text が見つけた番地(infobase)、SRAM 版は固定
+LEAINFO         macro
+                ifd     XMODE
+                move.l  infobase(pc),\1
+                elseif
+                lea     INFO,\1
+                endc
+                endm
 IOCS_B_PRINT    equ     $21
 IOCS_ROMVER     equ     $8F
 IOCS_CRTMOD     equ     $10
@@ -166,16 +175,33 @@ nextbyte:
 ; linebuf に NUL 終端の文字列を作り txtlen に長さを入れる。スーパーバイザモードで呼ぶこと
 ; (バスエラーベクタを一時的に差し替える)。a6 = 情報ポート。
 build_text:
-                lea     INFO,a6
+                LEAINFO a6
                 LINEBUF a2
                 ; 基板がない(バスエラー)場合に備えて、ベクタ 2 を一時的に差し替えて magic を読む
+                ; (バスエラーは berr → probe_fail へ)
                 move.l  $8.w,d7
                 lea     berr(pc),a0
                 move.l  a0,$8.w
                 move.l  (a6),d0
-                move.l  d7,$8.w
                 cmp.l   #'VMPU',d0
-                bne     notfound
+                beq     bt_ok
+probe_fail:                             ; (グローバルラベル: berr から来る。以下のラベルも同じ理由でグローバル)
+                ifd     XMODE
+                cmp.l   #INFO_OLD,a6    ; 旧番地も試した後なら無し
+                beq     bt_nf
+                lea     INFO_OLD,a6     ; 1.0.0 のカーネル: 旧番地を試す(berr がベクタを戻すので再設定)
+                lea     berr(pc),a0
+                move.l  a0,$8.w
+                move.l  (a6),d0
+                cmp.l   #'VMPU',d0
+                bne     bt_nf
+                lea     infobase(pc),a0
+                move.l  a6,(a0)         ; 以後は旧番地を使う
+                bra     bt_ok
+                endc
+bt_nf:          move.l  d7,$8.w
+                bra     notfound
+bt_ok:          move.l  d7,$8.w
 
                 ; ---- 実効速度の計測(既知サイクル数のループを us カウンタで挟む)
                 bsr     read_us
@@ -284,6 +310,10 @@ build_text:
                 bra     fin
 
 notfound:
+                ifd     XMODE
+                lea     infobase(pc),a0
+                clr.l   (a0)            ; 以後 LEAINFO は 0 を返す(再読みしない)
+                endc
                 lea     msg_none(pc),a0
                 bsr     puts
 fin:
@@ -297,10 +327,10 @@ fin:
                 endc
                 rts
 
-; バスエラー(68000 の 14 バイトフレーム): 例外フレームの拡張部を捨て、notfound へ戻す
+; バスエラー(68000 の 14 バイトフレーム): 例外フレームの拡張部を捨て、probe_fail へ戻す(旧番地を試すか notfound)
 berr:
                 addq.l  #8,sp
-                lea     notfound(pc),a0
+                lea     probe_fail(pc),a0
                 move.l  a0,2(sp)
                 move.l  d7,$8.w         ; 元のベクタへ戻す
                 rte
@@ -409,6 +439,7 @@ SET_JIT         equ     $F4
 SET_SB          equ     $F6             ; 起動画面 0/1
 SET_RAM         equ     $F8             ; メイン RAM の固定値(MB、0 = 自動)
 SET_NAME        equ     $FA             ; 1 を書くと $C0 の文字列をホスト名として保存
+SET_SMI         equ     $FC             ; SMI 転送 0/1(読みで 2 = この基板では使えない = V1.0)
 NAMEBUF         equ     $C0             ; ホスト名(32 バイト、NUL 終端。基板が現在の名前を置き、-n はここへ書く)
 build_settings:
                 lea     msg_speed(pc),a0
@@ -461,10 +492,23 @@ build_settings2:
                 beq     .auto
                 bsr     putdec
                 lea     msg_mbsp(pc),a0
-                bra     puts
+                bsr     puts
+                bra     .smi
 .auto:          lea     msg_auto(pc),a0
-                bra     puts
+                bsr     puts
+.smi:           lea     msg_smi(pc),a0
+                bsr     puts
+                move.w  SET_SMI(a6),d0  ; 0/1、2 = V1.0(SMI 無し)
+                lea     msg_off(pc),a0
+                beq     .stxt
+                lea     msg_on(pc),a0
+                cmp.w   #1,d0
+                beq     .stxt
+                lea     msg_na(pc),a0
+.stxt:          bra     puts
 msg_host:       dc.b    'HOST: ',0
+msg_smi:        dc.b    '   SMI: ',0
+msg_na:         dc.b    '-',0
 msg_bootscr:    dc.b    '   BOOT SCREEN: ',0
 msg_ramsz:      dc.b    '   RAM SIZE: ',0
 msg_mbsp:       dc.b    ' MB',0
@@ -612,7 +656,7 @@ msg_mhz:        dc.b    'MHz',0
 msg_ram:        dc.b    '   RAM: ',0
 msg_mb:         dc.b    'MB',0
 msg_crlf:       dc.b    13,10,0
-msg_none:       dc.b    13,10,'  VMPU68: VMPU68 information port not found ($ECFF00)',13,10,0
+msg_none:       dc.b    13,10,'  VMPU68: VMPU68 information port not found ($ECD000)',13,10,0
                 even
 linebuf:        ds.b    512
 devend:
@@ -636,7 +680,7 @@ sstart:
                 bne     .sdone
                 bsr     shear_x68000
                 bsr     squash_sharp
-                lea     INFO,a6
+                LEAINFO a6
                 LINEBUF a2              ; 5 行目: 設定(速度 / ライトバック / JIT)
                 bsr     build_settings
                 lea     msg_crlf(pc),a0
@@ -694,10 +738,12 @@ xstart:
                 move.l  d0,-(sp)
                 ; 基板の有無を確認(build_text が magic を見る)
                 bsr     build_text
-                lea     INFO,a6
+                LEAINFO a6
+                move.l  a6,d0
+                beq     .show           ; 基板がなければ表示だけ(未検出メッセージ。再読みするとバスエラー)
                 move.l  (a6),d0
                 cmp.l   #'VMPU',d0
-                bne     .show           ; 基板がなければ表示だけ(未検出メッセージ)
+                bne     .show
                 moveq   #0,d6           ; 設定を書いたら 1
                 moveq   #0,d1
                 move.b  (a5)+,d1        ; 引数の長さ
@@ -726,6 +772,8 @@ xstart:
                 beq     .opt_m
                 cmp.b   #'n',d0
                 beq     .opt_n
+                cmp.b   #'t',d0
+                beq     .opt_t
                 cmp.b   #'w',d0
                 bne     .parse
                 bsr     getnum
@@ -755,6 +803,12 @@ xstart:
                 cmp.w   #12,d2
                 bhi     .parse
                 move.w  d2,SET_RAM(a6)
+                moveq   #1,d6
+                bra     .parse
+.opt_t:         bsr     getnum          ; -t1|-t0: SMI 転送(V2.0 以降の基板。V1.0 では無視される)
+                cmp.w   #1,d2
+                bhi     .parse
+                move.w  d2,SET_SMI(a6)
                 moveq   #1,d6
                 bra     .parse
 .opt_n:         ; -n<name>: 次の " -" までをホスト名にする(先頭の空白は飛ばす、31 バイトまで)。
@@ -815,7 +869,9 @@ xstart:
 .nologo:        move.l  a4,d0           ; -b: ここまで
                 bne     .exit
                 ; 設定行
-                lea     INFO,a6
+                LEAINFO a6
+                move.l  a6,d0
+                beq     .exit           ; 基板なし(再読みしない)
                 move.l  (a6),d0
                 cmp.l   #'VMPU',d0
                 bne     .exit
@@ -851,9 +907,11 @@ getnum:         moveq   #0,d2
                 bra     .g
 .gend:          rts
 
-msg_usage:      dc.b    13,10,13,10,'usage: VMPU68 [-b] [-s10|-s16|-s24|-s0] [-w1|-w0] [-j1|-j0] [-i1|-i0] [-m<MB>|-m0] [-n<name>]',13,10
+msg_usage:      dc.b    13,10,13,10,'usage: VMPU68 [-b] [-s10|-s16|-s24|-s0] [-w1|-w0] [-j1|-j0] [-i1|-i0] [-m<MB>|-m0]',13,10
+                dc.b    '              [-n<name>] [-t1|-t0]',13,10
                 dc.b    '  -b: banner only   -s: speed   -w: write-back   -j: JIT   -i: boot screen',13,10
-                dc.b    '  -m: RAM size (0=auto, next boot)   -n: host name (up to the next " -")',13,10,13,10,0
+                dc.b    '  -m: RAM size (0=auto, next boot)   -n: host name (up to the next " -")   -t: SMI (V2.0+)',13,10,13,10,0
                 even
 namebuf:        ds.b    32              ; ワード転送するので偶数番地に
+infobase:       dc.l    INFO            ; 見つけた情報ポートの番地(build_text が旧番地に切り替えることがある)
                 endc

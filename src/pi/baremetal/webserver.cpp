@@ -265,7 +265,7 @@ THTTPStatus CVmpuWebServer::GetContent (const char *pPath, const char *pParams,
         Content.Format ("{\"device\":\"vmpu68\",\"name\":\"%s\",\"mac\":\"%s\","
                         "\"status\":%u,\"busy\":%s,\"fault\":%s,\"snoop_avail\":%s,"
                         "\"ipl\":%u,\"vpa\":%s,\"mock\":%s,\"board\":%d,\"firmware\":\"baremetal\","
-                        "\"version\":\"" VMPU68_VERSION "\",\"pi_version\":\"" VMPU68_PI_VERSION "\",\"fpga_version\":\"%s\",\"build\":\"" VMPU68_BUILD "\",\"uptime\":%u,\"fpga_sum\":\"%s\",\"ram_mb\":%u,\"bus_mhz\":%u.%u,\"bus_class_min_mhz\":%u.%u,\"bus_class_source\":\"%s\",\"wr_ai\":%s,\"wr_setup\":%u,\"wr_setup_auto\":%s,\"io_mhz\":%u,\"wait_ns\":%u,\"equiv_mhz\":%u.%u,\"mhz_limit\":%u,\"wb\":%s,\"jit\":%s,\"sramboot\":%s,\"hw\":\"%s\","
+                        "\"version\":\"" VMPU68_VERSION "\",\"pi_version\":\"" VMPU68_PI_VERSION "\",\"fpga_version\":\"%s\",\"build\":\"" VMPU68_BUILD "\",\"uptime\":%u,\"fpga_sum\":\"%s\",\"ram_mb\":%u,\"bus_mhz\":%u.%u,\"bus_class_min_mhz\":%u.%u,\"bus_class_source\":\"%s\",\"wr_ai\":%s,\"smi\":%s,\"wr_setup\":%u,\"wr_setup_auto\":%s,\"io_mhz\":%u,\"wait_ns\":%u,\"equiv_mhz\":%u.%u,\"mhz_limit\":%u,\"wb\":%s,\"jit\":%s,\"sramboot\":%s,\"hw\":\"%s\","
                         "\"update\":{\"busy\":%s,\"phase\":\"%s\",\"done\":%u,\"total\":%u,\"msg\":\"%s\"}}",
                         (const char *) Name, (const char *) Mac, st,
                         (st & VST_BUSY) ? "true" : "false",
@@ -275,7 +275,7 @@ THTTPStatus CVmpuWebServer::GetContent (const char *pPath, const char *pParams,
                         (st & VST_VPA) ? "true" : "false",
                         hw_is_mock () ? "true" : "false",
                         vmpu68_board_id (),
-fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz10 () % 10, cls_min10 () / 10, cls_min10 () % 10, cls_source (), hw_wr_ai () ? "true" : "false", hw_wr_setup (),
+fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz10 () % 10, cls_min10 () / 10, cls_min10 () % 10, cls_source (), hw_wr_ai () ? "true" : "false", hw_smi () ? "true" : "false", hw_wr_setup (),
                         setup_auto () ? "true" : "false", io_mhz_now (), vmpu68_get_wait_ns (), vmpu68_equiv_mhz10 () / 10, vmpu68_equiv_mhz10 () % 10, vmpu68_mhz_limit (), emu68k_wb_enabled () ? "true" : "false", jit_enabled () ? "true" : "false", cfg_sramboot () ? "true" : "false", vmpu68_hw_rev (),
                         g_Update.busy ? "true" : "false", g_Update.phase,
                         g_Update.done, g_Update.total, g_Update.msg);
@@ -528,6 +528,9 @@ fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz1
         if (mhz >= 0 || wb >= 0 || jit >= 0) vmpu68_apply_settings (mhz, wb, jit, TRUE);
         int sbrc = 0;
         if (sb >= 0) sbrc = vmpu68_sramboot_set (sb, TRUE);
+        int smi = (int) param_num (pParams, "smi", 0xFFFF); if (smi == 0xFFFF) smi = -1; else smi = smi ? 1 : 0;
+        int smirc = 0;
+        if (smi >= 0) smirc = vmpu68_smi_set (smi, TRUE);   // core 2.x only (-1 on 1.x: reported, nothing changed)
         char name[40];
         if (param_str (pParams, "name", name, sizeof name))   // /api/config?name=<urlencoded>: host name (31 bytes max)
         {
@@ -535,8 +538,10 @@ fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz1
             cfg_set_name (name); cfg_save ();
         }
         CString N; for (const char *q = cfg_name (); *q; q++) { if (*q == '"' || *q == '\\') N.Append ("\\"); char c[2] = { *q, 0 }; N.Append (c); }
-        Content.Format ("{\"ok\":%s,\"mhz_limit\":%u,\"wb\":%s,\"jit\":%s,\"sramboot\":%s,\"sramboot_state\":%d,\"name\":\"%s\"%s}", sbrc ? "false" : "true", vmpu68_mhz_limit (), emu68k_wb_enabled () ? "true" : "false", jit_enabled () ? "true" : "false",
-                        cfg_sramboot () ? "true" : "false", vmpu68_sramboot_state (), (const char *) N, sbrc ? ",\"error\":\"SRAM write failed (X68000 off?)\"" : "");
+        Content.Format ("{\"ok\":%s,\"mhz_limit\":%u,\"wb\":%s,\"jit\":%s,\"sramboot\":%s,\"sramboot_state\":%d,\"smi\":%s,\"board\":%d,\"name\":\"%s\"%s%s}", (sbrc || smirc) ? "false" : "true", vmpu68_mhz_limit (), emu68k_wb_enabled () ? "true" : "false", jit_enabled () ? "true" : "false",
+                        cfg_sramboot () ? "true" : "false", vmpu68_sramboot_state (), hw_smi () ? "true" : "false", vmpu68_board_id (), (const char *) N,
+                        sbrc ? ",\"error\":\"SRAM write failed (X68000 off?)\"" : "",
+                        smirc == -1 ? ",\"error\":\"SMI is only on core 2.x boards\"" : smirc ? ",\"error\":\"the FPGA did not answer through SMI\"" : "");
     }
     else if (strcmp (pPath, "/api/locate") == 0)   // /api/locate[?ms=10000]: blink every colour (vfd68/vhd68 style)
     {

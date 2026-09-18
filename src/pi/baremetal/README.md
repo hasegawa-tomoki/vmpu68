@@ -59,7 +59,7 @@ vhd68.cfg / vfd68.cfg と同じ `key=value` 形式(release/config/vmpu68.cfg.sam
     name=X68000 XVI    # 表示名(Web UI ヘッダ・/api/status・ビーコン)。未設定なら "vmpu68"
     mhz=0 / wb=1 / jit=0   # 動作設定(速度上限・メイン RAM ライトバック・JIT)。Web UI / VMPU68.X / コンソールで変えると書き換えられる
     sramboot=0             # 1 = 起動画面(X68030 風の MPU/RAM/CLOCK 表示)。X68000 の SRAM に起動プログラムを書き込む(下記)
-    hw=2.1                 # 基板の版数を LAN の「近くの機器」に HW x.y として見せる(省略時は判別した 1.x → 1.0、2.x → 2.0)
+    hw=2.1                 # 基板の版数を LAN の「近くの機器」に HW x.y として見せる(省略時は判別した 1.x → 1.0、2.x → 2.0.1。V2.1 は判別できないので hw=2.1 を書く)
 
 Wi-Fi は従来どおり SD:/wpa_supplicant.conf(country=JP・ssid・psk・proto=WPA2・key_mgmt=WPA-PSK。country が無いと日本のチャネルで見つからないことがある)。
 
@@ -188,6 +188,52 @@ ServiceDuringUpdate() で Poll + Yield を挟む)。詳細は docs/design/bareme
 - `board 1` / `board 2` / `board auto` で vmpu68.cfg の board= を書き換える(次回起動から有効)。新品の 2.x 基板で
   FPGA を書く前に判別が 1.x に転ぶことはない(1.x は必ず FPGA が応答する)が、念のため `board 2` を書いておいてもよい。
 - 1.x / 2.x の割当表は vmpu68.h の先頭コメント(2.x は SMI の SD0-15 = GPIO8-23 配列)。
+- 2.x の FPGA は Pi から給電される(1.x は X68000 から)。X68000 が OFF でも FPGA は署名に応答するが、内部クロック
+  (バスクロック 16 MHz を PLL で逓倍)が止まっているのでレジスタ書込みは残らない(hello マーカーが立たない)。
+  監視は PLL ロック無しのときは「再コンフィグ」扱いにせず `hw: FPGA present but X68000 clock stopped (machine off?) - waiting`
+  を 1 回出して待ち、クロックが戻ったら `hw: X68000 clock back - re-initialising the FPGA` → 通常の電源 ON 手順で起動する。
+  この間 CORE の RGB LED は消灯(FPGA が駆動できない)。REG2 の低位バイトは 0x04(ai_ok のみ)で固定。
+- 2.0 基板の立上げ(2026-09-18): 1.0.0 の SD をそのまま挿して起動 → `board: core 2.x (default)`、J3 は UART2 で通る、
+  FPGA 未書込みなのでモックモード → `httpmgmt.py <IP> update vmpu68-1.0.0.vpk force` でフラッシュ(erase/program/verify OK、
+  flash id EF 40 16)→ 再起動で `core 2.x (probed)`、fpga_sum 64DA5713(ビットストリームは 1.x と共通、.pcf 不変)。
+
+## SMI 転送(core 2.x、smi=)
+
+2.x の Pi 側配線は SoC の SMI(Secondary Memory Interface、並列バス機能)の固定ピンに合わせてある
+(SA0/SA1 = GPIO5/4 = REG_A0/A1、SWE_N/SOE_N = GPIO7/6 = WR#/RD#、SD0-15 = GPIO8-23 = AD0-15)。
+`smi=1`(既定)のとき、レジスタの読み書きは GPIO のストローブ操作でなく SMI の直接モード(1 転送ずつ
+SMIDA/SMIDD/SMIDCS を叩く)で行う。プロトコル(REG0〜3、自動開始、アドレス自動更新、PI_IRQ 完了)は
+同じ。ホールド読み(RD# を下げたまま PI_IRQ を待つ)は SMI ではできないので、待ち付き読みのあいだだけ
+AD/REG_A/RD# を GPIO に戻して(GPFSEL の書込み 4 回、投入のみで数 ns)GPIO と同じホールド読みを行い、終わったら
+SMI に返す(vmpu68_io.c hold_read の smi_on 分岐、smi_capture がその GPFSEL 像を持つ)。最初に試した
+「PI_IRQ を待ってから DATA を SMI で 1 回読む」形は DATA 転送 ≈340 ns が余計で、si.x の machine が
+177 → 164 % に落ちた。混成にして 199 %(system 131 %)。
+
+- タイミングは SMI クロック(PLLD 750 MHz / 6 = 125 MHz、8 ns)単位: 書込み setup/strobe/hold = 1/4/2、
+  読出し 1/9/1、転送間 2。FPGA は 61 MHz でストローブを同期し、WR# が低い最初のクロックで AD/REG_A を
+  取り込む。1/3/2 まで詰めても vfy は通ったが余裕を見て 1/4/2。
+- 効果: 1 転送の中身は SMI の MMIO 往復(読み 73 ns ×2〜3 回)が主で、ストローブ幅ではない。書込みは投入のみで
+  CPU 側 ≈10 ns(転送は裏で進む)。`bench`: reg_write 276→214 ns、reg_read 337→343 ns(同等)、posted write
+  451→393。待ち付き読み(`ewait` の read phases)は GPIO 248+92+441 ≈ 850 ns → 混成 11+4+391 ≈ 450 ns(+SMI の
+  完了待ち)。**si.x: processor 2355 → 2358 %、system 120 → 131 %、machine 177.6 → 199.1 %**(同じ 2.0 基板、
+  GPIO → SMI 混成)。CPU 側で決まる換算クロック(VMPU68.X の CLOCK)は 164 MHz で変わらない。
+- 切替: コンソール `smi 0|1 [div ws wst wh rs rst rh pace]`(エミュレータを止める。cfg に保存、`erun 1` で再開)、
+  `smif <flags>`(実験: bit0 SMIDA 省略、bit1 DONE クリア省略、bit2 書込みの完了待ち省略 = **書込みが落ちる**ので不可)、
+  `smid <ns>`(読出しの最初の DONE ポーリング前の待ち: 効果なし)、`smib`(MMIO の所要時間)。
+  `/api/status` の `smi`。1.x では常に無効(`smi=` は無視)。
+- 検証(2026-09-18、core 2.0): 署名 + hello の往復、vfy テキスト VRAM 16384 語 ×5・GVRAM 8192 語、tvsweep 0/0 ×3、
+  Human68k 起動・FD の DMA・VMPU68.X。注意: vfy をメイン RAM に掛けるとライトバックの書き戻しが試験パターンを
+  上書きして「bad」が出る(GPIO でも同じ)。RAM の検証はテキスト VRAM で行う。
+- 主な余地は FIFO/DMA モードでの連続転送だが、レジスタが 1 語ごとに違う(ADDR/CTRL/DATA)のと先読み FIFO の
+  語数確認が要るので、現行のレジスタ設計のままでは効かない。
+
+## ADPCM 再生中の投入書込みの上限(pmax)
+
+FPGA はバス要求(BR)より前に投入された書込みを先に全部済ませてから DMAC にバスを渡すので、投入キューが深いと
+DMAC が数十 µs 待つ。ADPCM(MSM6258)は 64〜128 µs ごとに 1 バイトを DMA で受け取りバッファが無いため、この待ちが
+そのまま音の乱れになる(悪魔城ドラキュラで確認)。FD 転送中に上限を 6 に絞るのと同じ仕組みで、ADPCM の DMA が
+動いている間(CPU の $E92000〜3 / DMAC ch3 へのアクセス、または DMAC の $E92002 への書込みのスヌープ記録から 300 ms)は
+上限を 2 に絞る。コンソール `pmax [loose] [adpcm]` で変更、表示に fdc/adpcm の tight/idle。
 
 ## 起動画面(SRAM 起動プログラム、sramboot=)
 
@@ -211,7 +257,7 @@ VMPU68.X / VMPU68 -b / SRAM 起動画面の 3 つとも同じ。
 
 ## VMPU68.X(Human68k 側のコマンド、release/Human68k/VMPU68.X)
 
-x68k/vmpu68x/vmpu68.s(`build.sh`)。情報ポート $ECFF00 を読んで表示・設定する。VMPU68.SYS(CONFIG.SYS のドライバ)は
+x68k/vmpu68x/vmpu68.s(`build.sh`)。情報ポート $ECD000(1.0.0 は $ECFF00。FineScanner-X68 のスロット F と BANK RAM ボードの $ECFFFF に重なるので 1.1.0 で移動。VMPU68.X は新旧両方を探す)を読んで表示・設定する。VMPU68.SYS(CONFIG.SYS のドライバ)は
 2026-09-16 に廃止し、起動時の表示は「起動画面」設定(SRAM 起動プログラム)か AUTOEXEC.BAT の `VMPU68 -b` で行う。
 
     VMPU68            X68030 風の 4 行 + 現在の設定(SPEED / RAM / JIT、速度上限なしは Max)+ 1 行空けて使い方

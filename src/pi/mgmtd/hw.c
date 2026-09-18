@@ -212,6 +212,31 @@ int hw_set_wr_ai(int on)
 }
 int hw_wr_ai(void) { return mock ? 0 : vmpu68_wr_ai_io(); }
 
+/* SMI transport: switch, then prove the FPGA still answers through it -
+ * the signature, and the hello marker toggled twice (a write whose data
+ * arrived one transfer late would show up here as a shifted pattern). */
+int hw_set_smi(int on)
+{
+    if (mock) return -1;
+    int r;
+    HWLOCK();
+    r = vmpu68_set_smi(on);
+    if (r == 0 && on) {
+        int ok = 1;
+        for (unsigned i = 0; i < 4 && ok; i++) {
+            uint16_t v = (uint16_t)(i & 1 ? (ctrl_shadow | VSTW_HELLO) : (ctrl_shadow & ~VSTW_HELLO));
+            vmpu68_reg_write(VREG_STATUS, v);
+            uint16_t d = vmpu68_reg_read(VREG_CTRL);
+            if ((d >> 8) != 0x56 || ((d & VDIAG_HELLO) != 0) != ((v & VSTW_HELLO) != 0)) ok = 0;
+        }
+        vmpu68_reg_write(VREG_STATUS, ctrl_shadow);
+        if (!ok) { vmpu68_set_smi(0); r = -2; }
+    }
+    HWUNLOCK();
+    return r;
+}
+int hw_smi(void) { return mock ? 0 : vmpu68_smi_io(); }
+
 /* snoop stream v2 (REG3 bit13, echoed at VDIAG_SNOOP2).  Older bitstreams
  * have the idle WR# level, 1, in that bit: the probe writes the bit as 0
  * first and only trusts an echo that follows the write both ways. */

@@ -130,6 +130,161 @@ static unsigned ad_shift;
 const vmpu68_board_t *vmpu68_board(void) { return bd; }
 int vmpu68_board_id(void) { return bd->id; }
 
+/* ---- SMI transport (see vmpu68.h) ---- */
+static volatile uint32_t *smi, *cm;        /* SMI block, clock manager (bare metal only) */
+static int      smi_on;
+/* Timing in SMI clocks (PLLD 750 MHz / 6 = 125 MHz: 8 ns).  The FPGA samples
+ * the strobes at ~61 MHz (16 ns) and captures AD/REG_A on the first clock
+ * that sees WR# low, so a write needs the strobe low for > 1 sample and the
+ * data held through it; a read is sampled by the SMI at the end of its
+ * strobe, after the FPGA has frozen its read mux (~2 clocks).  Verified on
+ * core 2.0 (vfy of text/graphic VRAM, tvsweep, Human68k): write 1/3/2 and
+ * 1/4/2 clean; kept 1/4/2 and read 1/9/1 for margin.  Tighter settings gain
+ * nothing: a transfer costs ~200 ns (write) / ~340 ns (read) of MMIO
+ * traffic - DONE polls at 73 ns per read - not strobe time. */
+static unsigned smi_div = 6;
+static unsigned smi_ws = 1, smi_wst = 4, smi_wh = 2;   /* write: setup / strobe / hold (cycles) */
+static unsigned smi_rs = 1, smi_rst = 9, smi_rh = 1;   /* read:  setup / strobe / hold */
+static unsigned smi_pace = 2;              /* idle cycles between transfers (strobe high time for the FPGA's synchroniser) */
+static uint32_t smi_stat[4];
+static int      smi_pend;                  /* a write transfer may still be in flight (completion checked lazily) */
+static unsigned smi_flags;                 /* bit0: skip the SMIDA write when the register is unchanged;
+                                              bit1: do not clear DONE after a transfer (START clears it) */
+static unsigned smi_last_da = ~0u;
+/* GPIO images for the hold read while the SMI owns the pins: the SMI cannot
+ * keep RD# low while PI_IRQ is polled, so the AD/REG_A/RD# pins are handed
+ * to the GPIO block for one hold read (GPFSEL writes are posted, a few ns
+ * each) and given back afterwards.  smi_fsel: everything on ALT1;
+ * hold_a: REG_A output, AD input, RD# still ALT1 (idle high);
+ * hold_b: GPFSEL0 of hold_a with RD# output (its register value is low). */
+static uint32_t smi_fsel[3], hold_fsel_a[3], hold_fsel_b;
+static void smi_capture(void)
+{
+    for (unsigned r = 0; r < 3; r++) {
+        uint32_t v = GPFSEL[r];
+        smi_fsel[r] = v;
+        for (int i = 0; i < 16; i++) {
+            unsigned pin = bd->ad[i];
+            if (pin / 10 == r) v &= ~(7u << ((pin % 10) * 3));       /* AD: input */
+        }
+        if (bd->rega0 / 10 == r) v = (v & ~(7u << ((bd->rega0 % 10) * 3))) | (1u << ((bd->rega0 % 10) * 3));
+        if (bd->rega1 / 10 == r) v = (v & ~(7u << ((bd->rega1 % 10) * 3))) | (1u << ((bd->rega1 % 10) * 3));
+        hold_fsel_a[r] = v;
+    }
+    hold_fsel_b = (hold_fsel_a[bd->rd / 10] & ~(7u << ((bd->rd % 10) * 3))) | (1u << ((bd->rd % 10) * 3));
+}
+static unsigned smi_rdelay_ticks;          /* spin after a read's START before the first DONE poll (the poll costs a 73 ns MMIO read) */
+static unsigned smi_rdelay_ns;
+void vmpu68_smi_rdelay(unsigned ns) { smi_rdelay_ns = ns; smi_rdelay_ticks = ns ? pace_calc(ns) : 0; }
+unsigned vmpu68_smi_get_rdelay(void) { return smi_rdelay_ns; }
+#define SMI_CS   (smi[0x00 / 4])
+#define SMI_DSR0 (smi[0x10 / 4])
+#define SMI_DSW0 (smi[0x14 / 4])
+#define SMI_DC   (smi[0x30 / 4])
+#define SMI_DCS  (smi[0x34 / 4])
+#define SMI_DA   (smi[0x38 / 4])
+#define SMI_DD   (smi[0x3C / 4])
+#define SMI_DCS_ENABLE 1u
+#define SMI_DCS_START  2u
+#define SMI_DCS_DONE   4u
+#define SMI_DCS_WRITE  8u
+#define SMI_POLL_MAX   20000u
+#define CM_SMICTL (cm[0xB0 / 4])
+#define CM_SMIDIV (cm[0xB4 / 4])
+#define CM_PWD    (0x5Au << 24)
+#ifdef VMPU68_BAREMETAL
+void vmpu68_set_smi_base(volatile uint32_t *smi_base, volatile uint32_t *cm_base) { smi = smi_base; cm = cm_base; }
+#endif
+int vmpu68_smi_io(void) { return smi_on; }
+void vmpu68_smi_timing(unsigned div, unsigned wsetup, unsigned wstrobe, unsigned whold,
+                       unsigned rsetup, unsigned rstrobe, unsigned rhold, unsigned pace)
+{
+    if (div)     smi_div = div;
+    if (wsetup)  smi_ws  = wsetup;
+    if (wstrobe) smi_wst = wstrobe;
+    if (whold)   smi_wh  = whold;
+    if (rsetup)  smi_rs  = rsetup;
+    if (rstrobe) smi_rst = rstrobe;
+    if (rhold)   smi_rh  = rhold;
+    if (pace)    smi_pace = pace;
+}
+void vmpu68_smi_get(unsigned out[8])
+{
+    out[0] = smi_div; out[1] = smi_ws; out[2] = smi_wst; out[3] = smi_wh;
+    out[4] = smi_rs; out[5] = smi_rst; out[6] = smi_rh; out[7] = smi_pace;
+}
+void vmpu68_smi_stats(uint32_t out[4], int clear)
+{
+    for (int i = 0; i < 4; i++) { out[i] = smi_stat[i]; if (clear) smi_stat[i] = 0; }
+}
+void vmpu68_smi_flags(unsigned f) { smi_flags = f; smi_last_da = ~0u; }
+unsigned vmpu68_smi_get_flags(void) { return smi_flags; }
+static inline void smi_da(unsigned reg)
+{
+    if ((smi_flags & 1u) && reg == smi_last_da) return;
+    SMI_DA = reg;
+    smi_last_da = reg;
+}
+static inline void smi_done_clr(void)
+{
+    if (!(smi_flags & 2u)) SMI_DCS = SMI_DCS_ENABLE | SMI_DCS_DONE;
+}
+static inline void smi_sync(void)
+{
+    if (!smi_pend) return;
+    unsigned n = 0;
+    while (!(SMI_DCS & SMI_DCS_DONE)) if (++n > SMI_POLL_MAX) { smi_stat[2]++; break; }
+    smi_done_clr();
+    smi_pend = 0;
+}
+static inline void smi_wr(unsigned reg, uint16_t val)
+{
+    if (!(smi_flags & 4u)) smi_sync();     /* bit2: back-to-back writes without waiting for DONE (experiment) */
+    smi_da(reg);
+    SMI_DD = val;
+    SMI_DCS = SMI_DCS_ENABLE | SMI_DCS_WRITE | SMI_DCS_START;
+    smi_pend = 1;
+    smi_stat[0]++;
+}
+static inline uint16_t smi_rd(unsigned reg)
+{
+    smi_sync();
+    smi_da(reg);
+    SMI_DCS = SMI_DCS_ENABLE | SMI_DCS_START;
+    unsigned n = 0;
+    if (smi_rdelay_ticks) { uint64_t t0 = cnt_now(); while (cnt_now() - t0 < smi_rdelay_ticks) ; }
+    while (!(SMI_DCS & SMI_DCS_DONE)) if (++n > SMI_POLL_MAX) { smi_stat[2]++; break; }
+    smi_stat[3] += n;                      /* DONE polls that found the read still running */
+    uint32_t v = SMI_DD;
+    smi_done_clr();
+    smi_stat[1]++;
+    return (uint16_t)v;
+}
+/* micro-benchmark (ns per op): [0] SMIDCS read, [1] SMIDA write (posted, one
+ * read at the end), [2] register write (CTRL, fields restored by the caller),
+ * [3] register read (STATUS), [4] GPIO level read for comparison */
+void vmpu68_smi_bench(uint32_t out[5])
+{
+    const unsigned N = 10000;
+    uint64_t hz = vmpu68_tick_hz(), t0, t1;
+    volatile uint32_t sink = 0;
+    if (!smi_on) { for (int i = 0; i < 5; i++) out[i] = 0; return; }
+    smi_sync();
+    t0 = cnt_now(); for (unsigned i = 0; i < N; i++) sink += SMI_DCS; t1 = cnt_now();
+    out[0] = (uint32_t)((t1 - t0) * 1000000000ull / hz / N);
+    t0 = cnt_now(); for (unsigned i = 0; i < N; i++) SMI_DA = i & 3; sink += SMI_DCS; t1 = cnt_now();
+    out[1] = (uint32_t)((t1 - t0) * 1000000000ull / hz / N);
+    smi_last_da = ~0u;
+    uint16_t c = (uint16_t)(last_ctrl & 0xFFFF);
+    t0 = cnt_now(); for (unsigned i = 0; i < N; i++) smi_wr(VREG_CTRL, c); smi_sync(); t1 = cnt_now();
+    out[2] = (uint32_t)((t1 - t0) * 1000000000ull / hz / N);
+    t0 = cnt_now(); for (unsigned i = 0; i < N; i++) sink += smi_rd(VREG_STATUS); t1 = cnt_now();
+    out[3] = (uint32_t)((t1 - t0) * 1000000000ull / hz / N);
+    t0 = cnt_now(); for (unsigned i = 0; i < N; i++) sink += GPLEV0; t1 = cnt_now();
+    out[4] = (uint32_t)((t1 - t0) * 1000000000ull / hz / N);
+    (void)sink;
+}
+
 static void board_apply(void)
 {
     ad_mask = 0;
@@ -176,6 +331,7 @@ static inline uint32_t rega_bits(unsigned reg)
  * step for the non-AD pins that share a register (2.x: CRESET/SS in
  * GPFSEL0, IRQ/SPI in GPFSEL2). */
 static int ad_is_out;
+static void smi_pins(int on);
 
 static void ad_dir_init(void)
 {
@@ -199,7 +355,7 @@ static void ad_dir_init(void)
 
 static inline void ad_dir_out(int out)
 {
-    if (out == ad_is_out) return;
+    if (out == ad_is_out || smi_on) return;
     if (fsel_msk[0]) GPFSEL[0] = out ? fsel_out[0] : fsel_in[0];
     if (fsel_msk[1]) GPFSEL[1] = out ? fsel_out[1] : fsel_in[1];
     if (fsel_msk[2]) GPFSEL[2] = out ? fsel_out[2] : fsel_in[2];
@@ -238,6 +394,63 @@ int vmpu68_open(void)
     ad_dir_init();
     ad_dir_out(0);
     last_ctrl = last_data = 0xFFFFFFFFu;   /* force CTRL/DATA writes on the first cycle */
+    if (smi_on) { smi_pend = 0; smi_last_da = ~0u; smi_pins(1); }   /* re-opened (FPGA re-probe): SMI keeps the pins */
+    return 0;
+}
+
+/* SMI pins: SA1/SA0 = GPIO4/5 (REG_A1/A0), SOE_N/SWE_N = GPIO6/7 (RD#/WR#),
+ * SD0-15 = GPIO8-23 (AD0-15) - the 2.x layout was drawn for this (ALT1) */
+static void smi_pins(int on)
+{
+    if (on) {
+        for (int i = 0; i < 16; i++) fsel(bd->ad[i], 5);
+        fsel(bd->rega0, 5); fsel(bd->rega1, 5);
+        fsel(bd->wr, 5); fsel(bd->rd, 5);
+        ad_is_out = -1;
+        smi_capture();
+    } else {
+        GPSET0 = wr_bit | rd_bit;          /* idle high the moment they become outputs */
+        fsel(bd->wr, 1); fsel(bd->rd, 1); fsel(bd->rega0, 1); fsel(bd->rega1, 1);
+        ad_dir_init();                     /* AD back to input (images re-captured) */
+        ad_dir_out(0);
+    }
+}
+
+int vmpu68_set_smi(int on)
+{
+    if (!on) {
+        if (!smi_on) return 0;
+        smi_sync();
+        SMI_DCS = 0;
+        smi_on = 0;
+        smi_pins(0);
+        return 0;
+    }
+    if (smi_on) return 0;
+    if (!smi || !cm || bd->id != 2 || bd->ad[0] != 8 || bd->rega0 != 5 || bd->rega1 != 4 || bd->rd != 6 || bd->wr != 7)
+        return -1;
+    /* SMI clock: PLLD (750 MHz) / smi_div.  Stop, set the divider, restart. */
+    CM_SMICTL = CM_PWD | (1u << 5);        /* KILL: stop it whatever state it is in */
+    VMPU68_USLEEP(10);
+    CM_SMIDIV = CM_PWD | ((smi_div & 0xFFFu) << 12);
+    CM_SMICTL = CM_PWD | 6u;               /* source PLLD */
+    VMPU68_USLEEP(10);
+    CM_SMICTL = CM_PWD | (1u << 4) | 6u;   /* ENAB */
+    for (unsigned i = 0; i < 1000 && !(CM_SMICTL & (1u << 7)); i++) VMPU68_USLEEP(1);
+    /* device 0 timing, 16-bit wide.  setup: SA/SD stable before the strobe;
+     * strobe: SWE_N/SOE_N low; hold: SA/SD kept after; pace: idle before
+     * the next transfer.  All in SMI clocks. */
+    SMI_CS   = 0;
+    SMI_DC   = 0;
+    SMI_DSW0 = (1u << 30) | ((smi_ws & 0x3Fu) << 24) | ((smi_wh & 0x3Fu) << 16) | ((smi_pace & 0x7Fu) << 8) | (smi_wst & 0x7Fu);
+    SMI_DSR0 = (1u << 30) | ((smi_rs & 0x3Fu) << 24) | ((smi_rh & 0x3Fu) << 16) | ((smi_pace & 0x7Fu) << 8) | (smi_rst & 0x7Fu);
+    SMI_DCS  = SMI_DCS_ENABLE | SMI_DCS_DONE;
+    SMI_DA   = 0;
+    smi_pend = 0;
+    smi_last_da = 0;
+    /* strobes are idle high on the SMI side before the pins move over */
+    smi_pins(1);
+    smi_on = 1;
     return 0;
 }
 
@@ -338,6 +551,7 @@ void vmpu68_reg_write(unsigned reg, uint16_t val)
      * except in ai mode, where the strobe itself starts the cycle */
     if (reg == VREG_DATA) { if (val == last_data && !WR_AI_ON) return; last_data = val; }
     else if (reg != VREG_STATUS) wr_valid = 0;   /* ADDR_LO/CTRL: the FPGA's write address moved */
+    if (smi_on) { smi_wr(reg, val); return; }
     /* REG_A rides in the same GPSET/GPCLR pair as the data (one MMIO write
      * to the GPIO block is ~30ns; a bus access is 6-8 of them) */
     uint32_t bits = ad_pack(val) | rega_bits(reg);
@@ -353,6 +567,11 @@ void vmpu68_reg_write(unsigned reg, uint16_t val)
 uint16_t vmpu68_reg_read(unsigned reg)
 {
     uint32_t v;
+    if (smi_on) {
+        v = smi_rd(reg);
+        if (reg == VREG_STATUS) line_held = (uint16_t)(v & held_mask);
+        return (uint16_t)v;
+    }
     set_rega(reg);
     /* the FPGA (38MHz @ 10MHz bus) must sample the previous strobe HIGH
      * at least once and latch REG_A before RD# falls again: a ~30ns
@@ -510,6 +729,39 @@ static int hold_read(uint16_t *out)
 {
     uint32_t v;
     unsigned n;
+    if (smi_on) {
+        /* hybrid hold read: pins to the GPIO block for the wait (see smi_capture) */
+        smi_sync();                            /* the command strobe has left the SMI */
+        GPCLR0 = rega_mask | rd_bit;           /* REG_A = DATA, RD# register low (drives when it becomes an output) */
+        GPFSEL[0] = hold_fsel_a[0];            /* REG_A out, AD8/9 in */
+        GPFSEL[1] = hold_fsel_a[1];            /* AD in */
+        GPFSEL[2] = hold_fsel_a[2];
+        GPFSEL[0] = hold_fsel_b;               /* RD# falls, REG_A settled two writes earlier */
+        uint64_t t0 = cnt_now();
+        for (n = 0; n < VMPU68_PIN_UP_POLLS; n++)
+            if (pin_poll()) break;
+        uint64_t t1 = cnt_now();
+        wprof[1] += t1 - t0;
+        int ok = 0;
+        if (n < VMPU68_PIN_UP_POLLS) {
+            for (n = 0; n < VMPU68_PIN_POLLS; n++) {
+                v = GPLEV0;
+                if (!(v & irq_bit)) {
+                    *out = ad_unpack(v);
+                    poll_hist[0]++; wprof[2] += cnt_now() - t1; wprof[5]++;
+                    ok = 1;
+                    break;
+                }
+            }
+            if (!ok) wprof[7]++;
+        } else
+            wprof[6]++;
+        GPSET0 = rd_bit;                       /* RD# high as a GPIO, then back to the SMI (idle high) */
+        GPFSEL[0] = smi_fsel[0];
+        GPFSEL[1] = smi_fsel[1];
+        GPFSEL[2] = smi_fsel[2];
+        return ok;
+    }
     set_rega(VREG_DATA);
     ad_dir_out(0);                         /* always: the command write left the pins output */
     /* REG_A reaches the FPGA before RD#: it was issued two GPFSEL writes
@@ -806,6 +1058,7 @@ void vmpu68_flash_begin(void)
 void vmpu68_flash_end(void)
 {
     fsel(bd->creset, 0);           /* release: FPGA reconfigures */
+    if (smi_on) smi_capture();     /* CRESET's function select changed: refresh the hold-read images */
 }
 
 void vmpu68_flash_xfer(const uint8_t *tx, uint8_t *rx, unsigned n, int cont)

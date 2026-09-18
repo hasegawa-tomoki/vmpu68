@@ -47,6 +47,8 @@ int  hw_drv_state(void);
 void hw_set_autostart(int on);             /* 1 = 2-write bus cycles (faster, DRAM-margin sensitive) */
 int  hw_set_busy_irq(int on);              /* completion on PI_IRQ (returns the effective mode) */
 int  hw_busy_irq(void);
+int  hw_set_smi(int on);           /* SMI transport for the register bus (core 2.x): 0 ok, -1 unavailable, -2 the FPGA did not answer (reverted) */
+int  hw_smi(void);
 int  hw_set_wr_ai(int on);         /* ai write mode: 1 strobe per sequential write (needs the bitstream) */
 int  hw_wr_ai(void);
 unsigned hw_set_posted_max(unsigned n);  /* outstanding posted writes before a drain (0 = query) */
