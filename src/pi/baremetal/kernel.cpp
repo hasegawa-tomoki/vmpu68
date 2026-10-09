@@ -300,16 +300,35 @@ unsigned vmpu68_emu_type (const char *p, int enter, unsigned *pDropped)
 static const char FromKernel[] = "vmpu68";
 
 // SMI register transport (core 2.x): vmpu68.cfg smi= (default 1).  Called
-// after every successful hw_init(): the FPGA probe re-opens the pins as GPIO.
+// after every successful hw_init() (the FPGA probe re-opens the pins as GPIO)
+// and again from BootX68 once the bus clock is known: the strobe timing
+// depends on the FPGA clock (4 x bus clock), see vmpu68_smi_preset().
+static unsigned measure_bus_mhz10 (void);
+static unsigned s_smi_mhz10;                   // bus clock the current SMI timing was chosen for
+static unsigned smi_class (unsigned mhz10) { return (mhz10 && mhz10 < 140) ? 10 : 16; }
 static void apply_smi_cfg (void)
 {
     if (hw_is_mock () || vmpu68_board_id () != 2) return;
     int want = cfg_smi () ? 1 : 0;
-    if (want == hw_smi ()) return;
-    int r = hw_set_smi (want);
-    if (want)
-        CLogger::Get ()->Write (FromKernel, LogNotice, r == 0 ? "hw: SMI register transport on (smi=1)"
-                                                    : "hw: SMI transport unavailable (%d) - GPIO strobes", r);
+    unsigned m = s_bus_mhz10 ? s_bus_mhz10 : measure_bus_mhz10 ();
+    if (!want)
+    {
+        if (hw_smi ()) { hw_set_smi (0); CLogger::Get ()->Write (FromKernel, LogNotice, "hw: SMI transport off (smi=0) - GPIO strobes"); }
+        return;
+    }
+    if (hw_smi () && smi_class (m) == smi_class (s_smi_mhz10)) return;
+    if (hw_smi ()) hw_set_smi (0);             // the timing is latched when the transport is enabled
+    unsigned t[8];
+    vmpu68_smi_preset (m);
+    if (cfg_smi_t (t)) vmpu68_smi_timing (t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+    s_smi_mhz10 = m;
+    int r = hw_set_smi (1);
+    vmpu68_smi_get (t);
+    if (r == 0)
+        CLogger::Get ()->Write (FromKernel, LogNotice, "hw: SMI register transport on (smi=1): bus %u.%u MHz -> %u MHz class%s, write %u/%u/%u read %u/%u/%u pace %u",
+                                m / 10, m % 10, smi_class (m), cfg_smi_t (t) ? " (smi_t=)" : "", t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+    else
+        CLogger::Get ()->Write (FromKernel, LogNotice, "hw: SMI transport unavailable (%d) at bus %u.%u MHz - GPIO strobes", r, m / 10, m % 10);
 }
 
 // firmware mailbox tag: pass reboot flags to the bootloader; bit0 = tryboot
@@ -505,6 +524,13 @@ int vmpu68_smi_set (int on, boolean save)
 {
     if (hw_is_mock () || vmpu68_board_id () != 2) return -1;
     emu_quiesce ();
+    if (on)                                    // timing for the clock class (apply_smi_cfg does the same at boot)
+    {
+        unsigned t[8];
+        vmpu68_smi_preset (s_bus_mhz10);
+        if (cfg_smi_t (t)) vmpu68_smi_timing (t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+        s_smi_mhz10 = s_bus_mhz10;
+    }
     int r = hw_set_smi (on ? 1 : 0);
     if (r == 0 && save) { cfg_set_smi (on ? 1 : 0); cfg_save (); }
     s_emu_run = TRUE; DataSyncBarrier ();
@@ -2416,6 +2442,20 @@ static void sfl_wren (void)
 // (the FPGA is held in reset), so the Pi's ACT LED blinks at ~8 Hz meanwhile.
 // Called from every yield and from every flash status poll.
 static CKernel *s_pKernel = nullptr;
+
+// /api/con (webserver.cpp): run one console line through exec_cmd() with the
+// output collected into a string.  The follow-up actions a console would
+// take (reboot, file transfer) are returned, not performed.
+static void str_put (void *ctx, const char *s) { ((CString *) ctx)->Append (s); }
+int CKernel::ConsoleExec (const char *pLine, CString &Out)
+{
+    return exec_cmd (pLine, str_put, &Out, m_bNetOK, &m_Net);
+}
+int vmpu68_console_exec (const char *pLine, CString &Out)
+{
+    if (!s_pKernel) return -1;
+    return s_pKernel->ConsoleExec (pLine, Out);
+}
 static boolean s_act_fast;
 static void act_fast_tick (void)
 {
@@ -3251,6 +3291,7 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     // "auto" probes it here on the free bus.
     s_bus_mhz10 = measure_bus_mhz10 ();
     s_bus_cls = cfg_bus_select (s_bus_mhz10);
+    apply_smi_cfg ();                          // SMI strobe timing follows the clock class (10 vs 16 MHz)
     const cfg_bus_class *c = s_bus_cls;
     hw_set_wr_ai (c->ai);
     vmpu68_set_wait_ns (c->wait_ns);
@@ -3293,6 +3334,7 @@ TShutdownMode CKernel::Run (void)
 {
     CLogger::Get ()->Write (FromKernel, LogNotice,
                     "vmpu68 %s (circle %s) name \"%s\"", VMPU68_VERSION, CIRCLE_VERSION_STRING, cfg_name ());
+    s_pKernel = this;                          // /api/con and the ACT LED helpers need the instance from the start
 
     // the firmware leaves the ARM at its idle clock (600MHz on a Pi 4):
     // run the emulator core at full speed; the main loop below throttles

@@ -23,7 +23,8 @@ unsigned cfg_sramboot (void);           // sramboot=<0|1> X68030-style boot scre
 void cfg_set_sramboot (unsigned on);
 const char *cfg_hw (void);              // hw=<rev> board revision string ("" = derive from the board profile)
 unsigned cfg_smi (void);                // smi=<0|1> register transport on core 2.x (default 1); 1.x ignores it
-void cfg_set_smi (unsigned on);         // persisted by cfg_save()
+void cfg_set_smi (unsigned on);
+int  cfg_smi_t (unsigned out[8]);        // smi_t=div,ws,wst,wh,rs,rst,rh,pace (0 = not set; a 0 field keeps the preset)         // persisted by cfg_save()
 unsigned cfg_board (void);              // board=<1|2> GPIO layout; 0 = auto (probe the FPGA with both layouts)
 void cfg_set_board (unsigned id);       // 0 = auto; persisted by cfg_save()
 void cfg_set (unsigned mhz, unsigned wb, unsigned jit);   // change the runtime settings (in memory)

@@ -24,6 +24,7 @@
 // 3 hang (watchdog test), 5 install SD:/update.vpk
 extern volatile int g_WebAction;
 void vmpu68_led_locate (unsigned ms);
+int  vmpu68_console_exec (const char *pLine, CString &Out);   // /api/con (kernel.cpp): console line -> text, returns the console's action code
 void vmpu68_apply_settings (int mhz, int wb, int jit, boolean save);   // -1 = leave as is (kernel.cpp)
 unsigned vmpu68_mhz_limit (void);
 const char *vmpu68_hw_rev (void);

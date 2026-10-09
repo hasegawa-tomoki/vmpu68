@@ -69,11 +69,12 @@ static block_t *blocks;                /* MAX_BLOCKS */
 static uint32_t nblocks;
 static block_t *hash[HASH_SIZE];
 static block_t **granule;              /* 65536 個: グラニュールに始まるブロックの連鎖 */
-uint8_t  jit_code_map[65536];
+uint8_t  jit_code_map[1u << 19];
 static uint32_t *code;                 /* コード領域 */
 static uint32_t  code_used;
+static uint32_t  ndead;                /* 無効化されたまま残っているブロック数(コード領域の断片化の目安) */
 static int       enabled;
-static struct { uint64_t blocks_run, translated, flushes, invalidated, fallbacks, faults, interp_steps; } st;
+static struct { uint64_t blocks_run, translated, flushes, invalidated, fallbacks, faults, interp_steps, note_writes, map_clears; } st;
 
 int  jit_available(void) { return 1; }
 int  jit_enabled(void) { return enabled; }
@@ -116,7 +117,7 @@ void jit_flush_all(void)
     memset(hash, 0, sizeof hash);
     memset(granule, 0, 65536 * sizeof(block_t *));
     memset(jit_code_map, 0, sizeof jit_code_map);
-    nblocks = 0; code_used = 0;
+    nblocks = 0; code_used = 0; ndead = 0;
     st.flushes++;
 }
 
@@ -131,18 +132,31 @@ static void invalidate(block_t *b)
     b->valid = 0;
     block_t **pp = &hash[hfn(b->pc)];
     while (*pp) { if (*pp == b) { *pp = b->hnext; break; } pp = &(*pp)->hnext; }
-    st.invalidated++;
+    st.invalidated++; ndead++;
 }
-void jit_note_write(uint32_t a)
+void jit_note_write(uint32_t a, unsigned n)
 {
-    /* a を含むブロック = 開始グラニュールが a のグラニュール以前で、終端が a を超えるもの。
-     * ブロックは最大 96 バイト程度なので、a のグラニュールとその手前 1 つを見れば足りる */
+    /* [a, a+n) に掛かるブロック = 開始グラニュール(256 B)が a のグラニュール以前で、終端が a を超えるもの。
+     * ブロックは最大 96 バイト程度なので、a のグラニュールとその手前 1 つを見れば足りる。
+     * 呼ばれるのは jit_code_hit(a, n)(32 バイト単位のコード印)が立つときだけ。起動時に一度コードが
+     * 置かれた領域(のちにスタックや作業領域になる)は、最初の書込みでブロックが無効化された後も印が
+     * 残り、書込みの度にここでチェーンを歩いて遅くなっていた(winner2 の三角関数 12.5 倍 → 17.2 倍、
+     * docs 50)。生きているブロックがこの 32 B に掛かっていなければ印を下ろし、以後は呼ばれない。
+     * 幅 n は呼び出し側で確定している(8/16 ビット書込み、スヌープ記録の UDS/LDS)。幅を見ずに 4 バイト
+     * 固定にすると、ブロック直前の変数への書込みで直後のブロックを誤って無効化し続ける。 */
     uint32_t g = (a >> 8) & 0xFFFF;
+    uint32_t c = (a >> 5) & 0x7FFFF, c_lo = c << 5, c_hi = c_lo + 32;
+    int live = 0;
+    st.note_writes++;
     for (int k = 0; k < 2; k++) {
         uint32_t gg = (g - k) & 0xFFFF;
-        for (block_t *b = granule[gg]; b; b = b->gnext)
-            if (b->valid && a >= b->pc && a < b->end) invalidate(b);
+        for (block_t *b = granule[gg]; b; b = b->gnext) {
+            if (!b->valid) continue;
+            if (a < b->end && a + n > b->pc) { invalidate(b); continue; }
+            if (b->pc < c_hi && b->end > c_lo) live++;
+        }
     }
+    if (!live) { jit_code_map[c] = 0; st.map_clears++; }
 }
 
 /* ============ 生成コードの部品 ============ */
@@ -812,7 +826,11 @@ static int tr_instr(tr_t *t, unsigned op)
 /* ============ ブロックの翻訳 ============ */
 static block_t *translate(uint32_t pc0)
 {
-    if (nblocks >= MAX_BLOCKS || code_used + 8192 > CODE_WORDS) jit_flush_all();
+    /* 無効化されたブロックはコード領域に残り(再利用しない)、プログラムの再ロードを繰り返すと
+     * 生きているコードが断片化した数 MB に散らばる。dead が live を超えたら全部捨てて作り直す
+     * (翻訳し直しは安い: winner2 の三角関数が 12.5 倍 → 17.2 倍、docs 50)。ここは
+     * ブロックの外なので捨てて安全。 */
+    if (nblocks >= MAX_BLOCKS || code_used + 8192 > CODE_WORDS || (ndead > 4096 && ndead * 2 > nblocks)) jit_flush_all();
     block_t *b = &blocks[nblocks];
     memset(b, 0, sizeof *b);
     b->pc = pc0; b->end = pc0; b->valid = 1;
@@ -847,7 +865,7 @@ static block_t *translate(uint32_t pc0)
             b->end = t.pc; b->cycles = t.cycles;
             code_used += t.e.n;
             icache_sync(t.e.buf, t.e.buf + t.e.n);
-            for (uint32_t g = pc0 >> 8; g <= ((b->end - 1) >> 8); g++) jit_code_map[g & 0xFFFF] = 1;
+            for (uint32_t g = pc0 >> 5; g <= ((b->end - 1) >> 5); g++) jit_code_map[g & 0x7FFFF] = 1;
             b->gnext = granule[(pc0 >> 8) & 0xFFFF]; granule[(pc0 >> 8) & 0xFFFF] = b;
             st.translated++;
         }
@@ -963,18 +981,19 @@ int jit_debug_translate(uint32_t pc, char *out, unsigned n)
 
 unsigned jit_stats(char *buf, unsigned n)
 {
-    return (unsigned)snprintf(buf, n, "jit: %s, blocks %u (translated %llu, fallback-only %llu, invalidated %llu, flushes %llu), code %u KB, runs %llu, faults %llu, interp steps %llu",
-        enabled ? "on" : "off", nblocks, (unsigned long long)st.translated, (unsigned long long)st.fallbacks, (unsigned long long)st.invalidated,
-        (unsigned long long)st.flushes, code_used / 256, (unsigned long long)st.blocks_run, (unsigned long long)st.faults, (unsigned long long)st.interp_steps);
+    return (unsigned)snprintf(buf, n, "jit: %s, blocks %u (dead %u, translated %llu, fallback-only %llu, invalidated %llu, flushes %llu), code %u KB, runs %llu, faults %llu, interp steps %llu, write notes %llu (map clears %llu)",
+        enabled ? "on" : "off", nblocks, ndead, (unsigned long long)st.translated, (unsigned long long)st.fallbacks, (unsigned long long)st.invalidated,
+        (unsigned long long)st.flushes, code_used / 256, (unsigned long long)st.blocks_run, (unsigned long long)st.faults, (unsigned long long)st.interp_steps,
+        (unsigned long long)st.note_writes, (unsigned long long)st.map_clears);
 }
 #else
-uint8_t jit_code_map[65536];
+uint8_t jit_code_map[1u << 19];
 int  jit_available(void) { return 0; }
 int  jit_run(int cycles) { (void)cycles; return emu68k_step_interp(); }
 void jit_set_enabled(int on) { (void)on; }
 int  jit_enabled(void) { return 0; }
 void jit_flush_all(void) {}
-void jit_note_write(uint32_t a) { (void)a; }
+void jit_note_write(uint32_t a, unsigned n) { (void)a; (void)n; }
 unsigned jit_stats(char *buf, unsigned n) { return (unsigned)snprintf(buf, n, "jit: not available on this host"); }
 void jit_set_once(int on) { (void)on; }
 int  jit_once_done(void) { return 1; }

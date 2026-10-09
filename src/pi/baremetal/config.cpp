@@ -12,6 +12,7 @@ static unsigned s_SramBoot = 0;         // sramboot=<0|1>, default off
 static char s_HW[12] = "";             // hw=<rev>, e.g. 2.1; empty = from the board profile
 static unsigned s_Board;                // board=<1|2> GPIO layout, 0 = auto
 static unsigned s_SMI = 1;              // smi=<0|1>: SMI register transport on core 2.x
+static unsigned s_SMIT[8]; static int s_SMIT_set;   // smi_t=: manual SMI timing
 
 static void set_name (const char *v)
 {
@@ -76,6 +77,21 @@ void cfg_load (void)
             s_Board = (p[6] == '1' || p[6] == '2') ? (unsigned) (p[6] - '0') : 0;
         else if (strncmp (p, "smi=", 4) == 0)
             s_SMI = p[4] == '0' ? 0 : 1;
+        else if (strncmp (p, "smi_t=", 6) == 0)
+        {
+            // smi_t=div,ws,wst,wh,rs,rst,rh,pace: fixed SMI timing (0 = keep the preset's value)
+            const char *q = p + 6; unsigned k = 0;
+            while (k < 8)
+            {
+                unsigned n = 0; int any = 0;
+                while (*q >= '0' && *q <= '9') { n = n * 10 + (*q - '0'); q++; any = 1; }
+                if (!any) break;
+                s_SMIT[k++] = n;
+                if (*q != ',') break;
+                q++;
+            }
+            s_SMIT_set = k == 8;
+        }
         // unknown keys are ignored (forward compatible)
     }
     f_close (&f);
@@ -88,6 +104,7 @@ void cfg_set_sramboot (unsigned on) { s_SramBoot = on ? 1 : 0; }
 const char *cfg_hw (void) { return s_HW; }
 unsigned cfg_board (void) { return s_Board; }
 unsigned cfg_smi (void) { return s_SMI; }
+int cfg_smi_t (unsigned out[8]) { if (!s_SMIT_set) return 0; for (unsigned i = 0; i < 8; i++) out[i] = s_SMIT[i]; return 1; }
 void cfg_set_smi (unsigned on) { s_SMI = on ? 1 : 0; }
 void cfg_set_board (unsigned id) { s_Board = (id == 1 || id == 2) ? id : 0; }
 void cfg_set (unsigned mhz, unsigned wb, unsigned jit) { s_MHz = mhz <= 1000 ? mhz : 0; s_WB = wb ? 1 : 0; s_JIT = jit ? 1 : 0; }

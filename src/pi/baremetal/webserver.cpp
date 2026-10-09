@@ -626,6 +626,20 @@ fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz1
         emu68k_joy_set ((int) port, val, ms);
         Content.Format ("{\"ok\":true,\"port\":%u,\"val\":\"0x%02X\",\"ms\":%u}", port, val & 0xFF, ms);
     }
+    else if (strcmp (pPath, "/api/con") == 0)
+    {
+        // cmd=<url-encoded console line>: the same handlers as the UART/USB
+        // console; the reply is what they printed (text/plain).  Actions the
+        // console would take afterwards (reboot, file transfer) are not
+        // performed here - the reply says so.
+        char cmd[256];
+        if (!param_str (pParams, "cmd", cmd, sizeof cmd)) cmd[0] = 0;
+        CString Out;
+        int act = vmpu68_console_exec (cmd, Out);
+        if (act) { CString L; L.Format ("\r\n(console action %d not performed through /api/con)\r\n", act); Out.Append (L); }
+        Content = Out;
+        *ppContentType = "text/plain; charset=utf-8";
+    }
     else if (strcmp (pPath, "/api/key") == 0)
     {
         // text=<url-encoded ASCII> enter=<0|1>: type into Human68k's keyboard

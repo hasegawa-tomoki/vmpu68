@@ -12,8 +12,9 @@ int  jit_run(int cycles);                 /* 68000 を cycles 分だけ JIT で�
 void jit_set_enabled(int on);
 int  jit_enabled(void);
 void jit_flush_all(void);                 /* 翻訳済みコードを全て捨てる(リセット、再同期、ROM 無効化) */
-void jit_note_write(uint32_t a);          /* シャドウの a が書き換わった(jit_code_map[a>>8] が立っているときだけ呼ぶ) */
-extern uint8_t jit_code_map[65536];       /* 256 バイト単位: 翻訳済みコードを含む */
+void jit_note_write(uint32_t a, unsigned n);   /* シャドウの [a, a+n) が書き換わった(jit_code_hit(a, n) のときだけ呼ぶ) */
+extern uint8_t jit_code_map[1u << 19];    /* 32 バイト単位: 翻訳済みコードを含む(データと同じ 256 B に同居しても書込みで検査に来ないよう細かく) */
+static inline int jit_code_hit(uint32_t a, unsigned n) { return jit_code_map[(a >> 5) & 0x7FFFF] | jit_code_map[((a + n - 1) >> 5) & 0x7FFFF]; }
 unsigned jit_stats(char *buf, unsigned n);
 int  jit_debug_translate(uint32_t pc, char *out, unsigned n);   /* 翻訳だけ行い生成コードを 16 進で返す(デバッグ) */
 void jit_set_once(int on);                /* 次の jit_run で 1 ブロック(または 1 命令)だけ実行して戻る */

@@ -229,6 +229,20 @@ int hw_set_smi(int on)
             uint16_t d = vmpu68_reg_read(VREG_CTRL);
             if ((d >> 8) != 0x56 || ((d & VDIAG_HELLO) != 0) != ((v & VSTW_HELLO) != 0)) ok = 0;
         }
+        /* bursts: a strobe timing too fast for the FPGA clock passes single
+         * transfers but loses back-to-back ones (docs 49) */
+        for (unsigned i = 0; i < 256 && ok; i++) {
+            uint16_t v = (uint16_t)(i & 1 ? (ctrl_shadow | VSTW_HELLO) : (ctrl_shadow & ~VSTW_HELLO));
+            vmpu68_reg_write(VREG_STATUS, v);
+            if ((i & 15) == 15) {
+                uint16_t d = vmpu68_reg_read(VREG_CTRL);
+                if ((d >> 8) != 0x56 || ((d & VDIAG_HELLO) != 0) != ((v & VSTW_HELLO) != 0)) ok = 0;
+            }
+        }
+        for (unsigned i = 0; i < 256 && ok; i++) {
+            uint16_t d = vmpu68_reg_read(VREG_CTRL);
+            if ((d >> 8) != 0x56) ok = 0;
+        }
         vmpu68_reg_write(VREG_STATUS, ctrl_shadow);
         if (!ok) { vmpu68_set_smi(0); r = -2; }
     }

@@ -208,6 +208,27 @@ void vmpu68_smi_timing(unsigned div, unsigned wsetup, unsigned wstrobe, unsigned
     if (rhold)   smi_rh  = rhold;
     if (pace)    smi_pace = pace;
 }
+/* Timing preset for the FPGA clock, which is 4 x the X68000 bus clock (PLL):
+ * 64 MHz at 16 MHz, only 40 MHz at 10 MHz.  pi_if.v samples WR#/RD# through
+ * a 2-stage synchroniser and accepts a strobe only when the line was HIGH two
+ * clocks earlier, so a strobe must stay low >= 2 FPGA clocks and the line
+ * must be high >= 2.5 clocks between transfers.  The 16 MHz figures (low
+ * 32 ns, high 40 ns) are scaled by 64/40 for the 10 MHz class; the fast
+ * values at 40 MHz lose back-to-back transfers (snoop records of a SCSI DMA
+ * burst: "invalid media", HD boot failure - docs 49). */
+void vmpu68_smi_preset(unsigned mhz10)
+{
+    smi_div = 6;
+    if (mhz10 && mhz10 < 140) {           /* 10 MHz class (FPGA 40 MHz): write low 56 ns / high 72 ns, read low 120 ns / high 64 ns */
+        smi_ws = 2; smi_wst = 7; smi_wh = 3;
+        smi_rs = 2; smi_rst = 15; smi_rh = 2;
+        smi_pace = 4;
+    } else {                              /* 16 MHz class (FPGA 64 MHz): the measured 1.1.0 values */
+        smi_ws = 1; smi_wst = 4; smi_wh = 2;
+        smi_rs = 1; smi_rst = 9; smi_rh = 1;
+        smi_pace = 2;
+    }
+}
 void vmpu68_smi_get(unsigned out[8])
 {
     out[0] = smi_div; out[1] = smi_ws; out[2] = smi_wst; out[3] = smi_wh;

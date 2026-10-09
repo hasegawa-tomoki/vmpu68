@@ -220,6 +220,7 @@ int      vmpu68_set_smi(int on);
 int      vmpu68_smi_io(void);
 void     vmpu68_smi_timing(unsigned div, unsigned wsetup, unsigned wstrobe, unsigned whold,
                            unsigned rsetup, unsigned rstrobe, unsigned rhold, unsigned pace);
+void     vmpu68_smi_preset(unsigned mhz10);  /* timing for the bus clock class (0.1 MHz units; 0 = 16 MHz class) */
 void     vmpu68_smi_get(unsigned out[8]);   /* div, wsetup, wstrobe, whold, rsetup, rstrobe, rhold, pace */
 void     vmpu68_smi_stats(uint32_t out[4], int clear);   /* writes, reads, done timeouts, extra DONE polls on reads */
 void     vmpu68_smi_flags(unsigned f);      /* bit0: cache SMIDA, bit1: no DONE clear (experiments) */

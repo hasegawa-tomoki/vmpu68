@@ -56,6 +56,7 @@ public:
     // keep watchdog / USB / network alive while the main loop is busy
     // (package install); must be called at least every ~20 ms
     void ServiceDuringUpdate (void);
+    int  ConsoleExec (const char *pLine, CString &Out);   // /api/con: one console line, output appended to Out
     void ActLedOn (void)  { m_ActLED.On (); }     // FPGA flash access indicator (act_fast_tick)
     void ActLedOff (void) { m_ActLED.Off (); }
 

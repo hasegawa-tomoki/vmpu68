@@ -1243,14 +1243,14 @@ void m68k_write_memory_8(unsigned int a, unsigned int v)
     case MAP_SHADOW:
         if (watch_hit(a)) watch_log(a, v, 1, 0);
         shadow[a] = (uint8_t)v;
-        if (jit_code_map[a >> 8]) jit_note_write(a);
+        if (jit_code_hit(a, 1)) jit_note_write(a, 1);
         if (!wthrough) return;
         if (wb_on && !page_wt(a)) { dirty_set(a); wb_stat.wb_writes++; wb_slow(); return; }
         wb_stat.wt_writes++;
         break;
     case MAP_LOCAL:
         shadow[a] = (uint8_t)v;
-        if (jit_code_map[a >> 8]) jit_note_write(a);
+        if (jit_code_hit(a, 1)) jit_note_write(a, 1);
         return;
     case MAP_ROM:                       /* real ROM ignores writes anyway */
         break;
@@ -1281,7 +1281,7 @@ void m68k_write_memory_16(unsigned int a, unsigned int v)
         if (watch_hit(a)) watch_log(a, v, 2, 0);
         shadow[a] = (uint8_t)(v >> 8);
         shadow[a + 1] = (uint8_t)v;
-        if (jit_code_map[a >> 8]) jit_note_write(a);
+        if (jit_code_hit(a, 2)) jit_note_write(a, 2);
         if (!wthrough) return;
         if (wb_on && !page_wt(a)) { dirty_set(a); wb_stat.wb_writes++; wb_slow(); return; }
         wb_stat.wt_writes++;
@@ -1289,7 +1289,7 @@ void m68k_write_memory_16(unsigned int a, unsigned int v)
     case MAP_LOCAL:
         shadow[a] = (uint8_t)(v >> 8);
         shadow[a + 1] = (uint8_t)v;
-        if (jit_code_map[a >> 8]) jit_note_write(a);
+        if (jit_code_hit(a, 2)) jit_note_write(a, 2);
         return;
     case MAP_ROM:
         break;
@@ -1683,7 +1683,7 @@ static void sn_apply(const vmpu68_snoop_t *r)
         if (r->uds) shadow[r->addr] = (uint8_t)(r->data >> 8);
         if (r->lds) shadow[r->addr + 1] = (uint8_t)r->data;
         if (dirty && r->uds && r->lds) dirty_clr(r->addr);   /* real RAM now equals the shadow */
-        if (jit_code_map[r->addr >> 8]) jit_note_write(r->addr);
+        { uint32_t wa = r->uds ? r->addr : r->addr + 1; unsigned wn = (r->uds && r->lds) ? 2 : 1; if (jit_code_hit(wa, wn)) jit_note_write(wa, wn); }
     }
 }
 
@@ -1698,7 +1698,7 @@ static void sn_repair(void)
         if (hw_bus_read(a, 1, &v) & VST_FAULT) { hw_clear_fault(); continue; }
         shadow[a] = (uint8_t)(v >> 8);
         shadow[a + 1] = (uint8_t)v;
-        if (jit_code_map[a >> 8]) jit_note_write(a);
+        if (jit_code_hit(a, 2)) jit_note_write(a, 2);
         sn_stat_repaired++;
     }
 }
@@ -1782,7 +1782,7 @@ int emu68k_poke16(uint32_t a, unsigned v)
     if (a + 1 >= ram_size || map[a >> PAGE_SHIFT] != MAP_SHADOW) return -1;
     shadow[a] = (uint8_t)(v >> 8);
     shadow[a + 1] = (uint8_t)v;
-    if (jit_code_map[a >> 8]) jit_note_write(a);
+    if (jit_code_hit(a, 2)) jit_note_write(a, 2);
     if (!wthrough) return 0;
     if (wb_on && dirty) { dirty_set(a); return 0; }
     return (hw_bus_write(a, 1, (uint16_t)v) & VST_FAULT) ? -1 : 0;
