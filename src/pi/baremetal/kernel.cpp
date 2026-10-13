@@ -63,6 +63,10 @@ static volatile unsigned s_emu_mhz;            // espd: emulated clock limit in 
 static unsigned s_bus_mhz10;                   // measured bus clock in 0.1 MHz (167 = 16.7), see BootX68
 static const cfg_bus_class *s_bus_cls;         // the timing class in use (config.h)
 static int s_bus_setup_auto = -1;              // wr_setup found by the boot probe (-1 = not probed)
+static int s_bus_slow_pref = 0;                // console 'slow 1': 5-clock bus cycles, kept across every BootX68 (diagnostics)
+static unsigned s_probe_bad[4];                // boot probe: words lost at wr_setup +0..+3 (131072-word samples, both bit directions)
+static int s_probe_ok = -1;                    // -1 not probed, 1 a loss-free setting was found, 0 losses at every setting (A/B health)
+static int s_probe_slow = -1;                  // bus cycle type the probe ran with (0 = 4-clock, 1 = 5-clock)
 static const char *probed_str (void);          // " (probed: n)" for bcls
 
 // pace the emulator against the 1 MHz system timer so that ROM/software delay loops
@@ -371,7 +375,7 @@ CKernel::~CKernel (void)
 {
 }
 
-static void ab_boot_check (void);          // A/B tryboot promote/rollback (defined below)
+static int  ab_boot_check (void);          // A/B tryboot promote/rollback (defined below)
 static void fpga_version_fixup (void);     // SD:/fpga.sum version from SD:/update.vpk (defined below)
 
 // JIT code buffer: circle maps everything above _etext execute-never (PXN)
@@ -634,7 +638,8 @@ boolean CKernel::Initialize (void)
     CLogger::Get ()->Write (FromKernel, LogNotice, "board: %s (%s), console UART%u",
                     vmpu68_board ()->name, how, vmpu68_board ()->uart);
     if (bOK) bOK = m_CDCGadget.Initialize ();
-    if (bOK) ab_boot_check ();            // A/B: promote/roll back a tryboot kernel (before the risky init)
+    if (bOK && ab_boot_check () == 2)     // A/B: promote/roll back a tryboot kernel (before the risky init)
+        FpgaRestorePrev (m_pSerial);      // ...and the bitstream the try update replaced
     s_emu_mhz = cfg_mhz ();             // emulated clock limit (0 = unlimited), like the console espd
     emu68k_set_pace_mhz (s_emu_mhz);
     emu68k_wb_set (cfg_wb ());          // main RAM write-back (wb=, default on)
@@ -786,7 +791,10 @@ static u32 file_sum_range (FIL *f, u32 off, u32 len, boolean *pOK);   // fwd (de
 #define AB_MARKER "SD:/tryboot.pending"
 #define AB_STABLE "SD:/kernel8-rpi4.img"
 #define AB_TRY    "SD:/kernel8-try.img"
+#define AB_FPGA_PREV     "SD:/fpga-prev.bin"   // bitstream a try update replaced (put back on rollback)
+#define AB_FPGA_PREV_SUM "SD:/fpga-prev.sum"   // its fpga.sum line
 static int  s_ab_arm_promote;              // this boot is the try boot
+static const char *s_ab_state = "";       // status page: "" / "try" / "promoted" / "rolled back" / "held back"
 static char s_ab_label[40];
 
 static u32 file_sum_path (const char *path)
@@ -801,10 +809,22 @@ static void ab_write_marker (unsigned count, u32 trysum, const char *label)
     CString L; L.Format ("%u %08X %s\n", count, (unsigned) trysum, label ? label : "");
     UINT bw; f_write (&f, (const char *) L, L.GetLength (), &bw); f_sync (&f); f_close (&f);
 }
-static void ab_boot_check (void)
+// Copy a small text file (fpga.sum lines); FALSE when the source is absent
+static boolean file_copy_small (const char *src, const char *dst)
+{
+    FIL f; char buf[128]; UINT br = 0, bw = 0;
+    if (f_open (&f, src, FA_READ) != FR_OK) return FALSE;
+    f_read (&f, buf, sizeof buf, &br); f_close (&f);
+    if (f_open (&f, dst, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) return FALSE;
+    f_write (&f, buf, br, &bw); f_sync (&f); f_close (&f);
+    return bw == br;
+}
+// 0 = nothing pending, 1 = this is the try boot, 2 = rolled back to stable
+// (the caller restores the bitstream saved by the try update, if any)
+static int ab_boot_check (void)
 {
     FIL f; char line[80] = "";
-    if (f_open (&f, AB_MARKER, FA_READ) != FR_OK) return;
+    if (f_open (&f, AB_MARKER, FA_READ) != FR_OK) return 0;
     f_gets (line, sizeof line, &f); f_close (&f);
     unsigned count = 0; u32 trysum = 0; char label[40] = "";
     const char *q = line; while (*q == ' ') q++;
@@ -819,19 +839,30 @@ static void ab_boot_check (void)
 
     if (trysum == file_sum_path (AB_STABLE))    // already promoted (or identical): clean up
     {
-        f_unlink (AB_MARKER); f_unlink (AB_TRY);
+        f_unlink (AB_MARKER); f_unlink (AB_TRY); f_unlink (AB_FPGA_PREV); f_unlink (AB_FPGA_PREV_SUM);
         CLogger::Get ()->Write (FromKernel, LogNotice, "A/B: try '%s' already in stable slot - cleaned up", label);
-        return;
+        return 0;
     }
     if (++count >= 2)                           // fell back to stable: the try did not stick
     {
         f_unlink (AB_MARKER); f_unlink (AB_TRY);
+        s_ab_state = "rolled back";
         CLogger::Get ()->Write (FromKernel, LogWarning, "A/B: try '%s' did not boot cleanly - rolled back to stable", label);
-        return;
+        return 2;
     }
     ab_write_marker (count, trysum, label);     // count == 1: this is the try boot
-    s_ab_arm_promote = 1;
+    s_ab_arm_promote = 1; s_ab_state = "try";
     CLogger::Get ()->Write (FromKernel, LogNotice, "A/B: running try kernel '%s' - promote after health check", label);
+    return 1;
+}
+// A/B health: what still blocks promoting the try kernel (NULL = healthy).
+// 1.1.2 promoted on 20 s of uptime alone; a bitstream that lost words was
+// never caught that way (docs 55).
+static const char *ab_health_block (void)
+{
+    if (s_probe_ok == 0) return "the wr_setup probe lost words at every setting";
+    if (!hw_is_mock () && !s_emu_run) return "the emulator is not running (X68000 off?)";
+    return nullptr;
 }
 static boolean ab_promote (void)
 {
@@ -854,7 +885,8 @@ static boolean ab_promote (void)
     if (ok) { f_unlink (AB_STABLE); ok = f_rename ("SD:/kernel8.new", AB_STABLE) == FR_OK; }
     if (!ok) { f_unlink ("SD:/kernel8.new");
                CLogger::Get ()->Write (FromKernel, LogError, "A/B: promote FAILED (SD write) - will roll back on next boot"); return FALSE; }
-    f_unlink (AB_MARKER); f_unlink (AB_TRY);
+    f_unlink (AB_MARKER); f_unlink (AB_TRY); f_unlink (AB_FPGA_PREV); f_unlink (AB_FPGA_PREV_SUM);
+    s_ab_state = "promoted";
     CLogger::Get ()->Write (FromKernel, LogNotice, "A/B: try '%s' promoted to stable", s_ab_label);
     return TRUE;
 }
@@ -893,6 +925,32 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         int word = !(*p == ' ' && p[1] == 'b');
         uint16_t st = hw_bus_write (addr, word, (uint16_t) val);
         R.Format ("[%06X] <- %04X%s\r\n", addr, val, (st & VST_FAULT) ? " FAULT" : "");
+    }
+    else if (p[0] == 'f' && p[1] == 'i' && p[2] == 'l' && p[3] == 'l')   // fill <addr> <words> <seed>: write WRTEST's pattern (word i = i*$9E37 + seed*$1111 + $2468) from the Pi
+    {
+        p += 4;
+        unsigned a = parse_num (p) & 0xFFFFFE, n = parse_num (p), seed = parse_num (p);
+        unsigned faults = 0;
+        for (unsigned i = 0; i < n; i++)
+        {
+            uint16_t v = (uint16_t) (i * 0x9E37u + seed * 0x1111u + 0x2468u);
+            if (hw_bus_write (a + 2 * i, 1, v) & VST_FAULT) { faults++; hw_clear_fault (); }
+        }
+        hw_wq_sync ();
+        R.Format ("fill %06X x%u seed %u: faults=%u\r\n", a, n, seed, faults);
+    }
+    else if (p[0] == 'c' && p[1] == 'h' && p[2] == 'k' && p[3] == ' ')   // chk <addr> <words> <seed>: read back and count words != WRTEST's pattern (first mismatch shown)
+    {
+        p += 4;
+        unsigned a = parse_num (p) & 0xFFFFFE, n = parse_num (p), seed = parse_num (p);
+        unsigned bad = 0, faults = 0, first = ~0u; uint16_t got0 = 0, want0 = 0;
+        for (unsigned i = 0; i < n; i++)
+        {
+            uint16_t v = 0, want = (uint16_t) (i * 0x9E37u + seed * 0x1111u + 0x2468u);
+            if (hw_bus_read (a + 2 * i, 1, &v) & VST_FAULT) { faults++; hw_clear_fault (); }
+            if (v != want) { bad++; if (first == ~0u) { first = a + 2 * i; got0 = v; want0 = want; } }
+        }
+        R.Format ("chk %06X x%u seed %u: bad=%u faults=%u first@%06X got %04X want %04X\r\n", a, n, seed, bad, faults, first, got0, want0);
     }
     else if (p[0] == 'l' && p[1] == 'e')                   // led <0-7> | led auto: hold a colour (bit2=R bit1=G bit0=B) / back to the status ladder
     {
@@ -1514,8 +1572,8 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
     {
         p += 4;
         while (*p == ' ') p++;
-        if (*p >= '0' && *p <= '9') { emu_quiesce (); hw_set_bus_slow (parse_num (p) ? 1 : 0); }
-        R.Format ("bus cycle %s\r\n", hw_bus_slow () ? "5 clocks (slow)" : "4 clocks");
+        if (*p >= '0' && *p <= '9') { emu_quiesce (); s_bus_slow_pref = parse_num (p) ? 1 : 0; hw_set_bus_slow (s_bus_slow_pref); }
+        R.Format ("bus cycle %s%s\r\n", hw_bus_slow () ? "5 clocks (slow)" : "4 clocks", s_bus_slow_pref ? " (kept across resets)" : "");
     }
     else if (p[0] == 'a' && p[1] == 's')                   // as <0|1>: 2-write bus cycle mode (faster)
     {
@@ -2530,6 +2588,7 @@ static void fpga_version_fixup (void)
             { 0x83F73070, 0x000100 }, { 0x9610EB35, 0x000101 }, { 0x016736A9, 0x000102 }, { 0xCE273913, 0x000103 },
             { 0x4A3402A2, 0x000105 }, { 0x60AFBB62, 0x000106 }, { 0x8B345498, 0x000107 }, { 0x6EE83BCE, 0x000108 },
             { 0xA54FC955, 0x000109 }, { 0x6714AB36, 0x00010D }, { 0xF2B1BAC5, 0x000111 }, { 0x64DA5713, 0x010000 },   // 1.0.0 (same bitstream as 0.1.18)
+            { 0xBBA7FA40, 0x010001 },   // 1.0.1 (1.1.3: write-data setup applied to 4-clock cycles too, docs 55)
         };
         for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) if (known[i].sum == sum && len == 135100) { flags = known[i].ver; from = "release table"; }
     }
@@ -2660,6 +2719,86 @@ int CKernel::FpgaFlashCompare (CDevice *pDev, const u8 *img, unsigned len)
     CString R; R.Format ("fpga: flash id %02X %02X %02X, compare with %u bytes: %s\r\n", rx[1], rx[2], rx[3], len, r == 0 ? "identical" : r == 1 ? "differs" : "no chip");
     dev_put (pDev, (const char *) R);
     return r;
+}
+
+// Read len bytes of the configuration flash into img (the FPGA is held in
+// reset meanwhile and reconfigures from the flash afterwards)
+boolean CKernel::FpgaFlashRead (u8 *img, unsigned len)
+{
+    const unsigned VCH = 16384;
+    u8 *vtx = (u8 *) malloc (VCH + 4);
+    u8 *vrx = (u8 *) malloc (VCH + 4);
+    if (!vtx || !vrx) { free (vtx); free (vrx); return FALSE; }
+    vmpu68_set_gpio_base ((volatile unsigned int *) ARM_GPIO_BASE);
+    if (vmpu68_open () != 0) { free (vtx); free (vrx); return FALSE; }
+    vmpu68_flash_begin ();
+    s_pKernel = this;
+    s_pXferYield = xfer_yield;
+    s_act_fast = TRUE;
+    { u8 w = 0xAB; sspi_xfer (&w, 0, 1, s_fpga_us); }       // release power-down
+    CTimer::SimpleusDelay (5000);
+    u8 tx[4] = {0x9F, 0, 0, 0}, rx[4];
+    sspi_xfer (tx, rx, 4, s_fpga_us);
+    boolean ok = !(rx[1] == 0x00 || rx[1] == 0xFF);
+    for (u32 a = 0; a < len && ok; a += VCH)
+    {
+        ServiceDuringUpdate ();
+        unsigned n = len - a > VCH ? VCH : len - a;
+        memset (vtx, 0, 4 + n);
+        vtx[0] = 0x03; vtx[1] = (u8)(a >> 16); vtx[2] = (u8)(a >> 8); vtx[3] = (u8)a;
+        sspi_xfer (vtx, vrx, 4 + n, s_fpga_us);
+        memcpy (img + a, vrx + 4, n);
+    }
+    s_pXferYield = nullptr; s_act_fast = FALSE; if (s_pKernel) s_pKernel->ActLedOff ();
+    vmpu68_flash_end ();                       // CRESET_B released: the FPGA reconfigures from the flash
+    free (vtx); free (vrx);
+    return ok;
+}
+
+// A/B: keep the bitstream a try update is about to replace (SD:/fpga-prev.bin
+// and the fpga.sum line), so that a rollback can put it back
+boolean CKernel::FpgaBackupPrev (CDevice *pDev, unsigned len)
+{
+    u8 *img = (u8 *) malloc (len);
+    if (!img) return FALSE;
+    g_Update.phase = "fpga backup"; g_Update.done = 0; g_Update.total = len;
+    boolean ok = FpgaFlashRead (img, len);
+    FIL f; UINT bw = 0;
+    if (ok) ok = f_open (&f, AB_FPGA_PREV, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK;
+    if (ok) { ok = f_write (&f, img, len, &bw) == FR_OK && bw == len; f_sync (&f); f_close (&f); }
+    free (img);
+    if (ok) { if (!file_copy_small (FPGA_SUM_FILE, AB_FPGA_PREV_SUM)) f_unlink (AB_FPGA_PREV_SUM); }
+    else f_unlink (AB_FPGA_PREV);
+    CString R; R.Format ("fpga: previous bitstream (%u bytes) %s\r\n", len, ok ? "saved for rollback" : "NOT saved");
+    dev_put (pDev, (const char *) R);
+    return ok;
+}
+
+// A/B rollback: reprogram the bitstream saved by FpgaBackupPrev, if there is one
+boolean CKernel::FpgaRestorePrev (CDevice *pDev)
+{
+    FIL f;
+    if (f_open (&f, AB_FPGA_PREV, FA_READ) != FR_OK) return FALSE;
+    unsigned len = f_size (&f);
+    u8 *img = (u8 *) malloc (len);
+    UINT br = 0;
+    boolean ok = img && len >= 1024 && f_read (&f, img, len, &br) == FR_OK && br == len;
+    f_close (&f);
+    if (ok)
+    {
+        CLogger::Get ()->Write (FromKernel, LogWarning, "A/B: restoring the previous bitstream (%u bytes)", len);
+        ok = FpgaFlashImage (pDev, img, len);
+    }
+    free (img);
+    if (ok)
+    {
+        file_copy_small (AB_FPGA_PREV_SUM, FPGA_SUM_FILE);   // its version line, when it had one
+        f_unlink (AB_FPGA_PREV); f_unlink (AB_FPGA_PREV_SUM);
+        CLogger::Get ()->Write (FromKernel, LogNotice, "A/B: previous bitstream restored");
+    }
+    else
+        CLogger::Get ()->Write (FromKernel, LogError, "A/B: restoring the previous bitstream FAILED - SD:/fpga-prev.bin kept ('fpga SD:/fpga-prev.bin' retries)");
+    return ok;
 }
 
 boolean CKernel::FpgaFlashImage (CDevice *pDev, const u8 *img, unsigned len)
@@ -2934,6 +3073,8 @@ boolean CKernel::Update (CDevice *pDev, const char *pPath, boolean bTry, boolean
               && f_read (&f, img, h.fpga_len, &br) == FR_OK && br == h.fpga_len;
             f_close (&f);
         }
+        if (ok && bTry && !FpgaBackupPrev (pDev, h.fpga_len))
+            dev_put (pDev, "fpga: the current bitstream could not be saved - a rollback would keep the new one\r\n");
         if (ok)
             ok = FpgaFlashImage (pDev, img, h.fpga_len);
         free (img);
@@ -3164,6 +3305,9 @@ unsigned vmpu68_bus_mhz (void) { return (s_bus_mhz10 + 5) / 10; }
 unsigned vmpu68_bus_mhz10 (void) { return s_bus_mhz10; }
 const cfg_bus_class *vmpu68_bus_class (void) { return s_bus_cls; }
 int vmpu68_bus_setup_auto (void) { return s_bus_setup_auto; }
+int vmpu68_bus_probe_ok (void) { return s_probe_ok; }
+const unsigned *vmpu68_bus_probe_lost (void) { return s_probe_bad; }
+const char *vmpu68_ab_state (void) { return s_ab_state; }
 static const char *probed_str (void)
 {
     static char buf[24];
@@ -3191,36 +3335,53 @@ static unsigned measure_bus_mhz10 (void)
     return 0;
 }
 
-// Probe the write-data setup the DRAM needs at this clock: with the machine
-// just out of reset and the emulator stopped the IPL has not run, so the top
-// 32 KB of main RAM can be used (saved and put back).  Writes $0000 then
-// $FFFF, 1 us apart (a floated bus, the worst case seen at 16 MHz), for
-// wr_setup 0..3 and takes the first with no lost word.  16384 words resolve
-// the ~1e-4 loss rate one tick below the edge (16 MHz: 0 and 1 fail, 2 is
-// clean over 100K+ words of testing).  ~300 ms.
+// Probe the write-data setup the DRAM needs at this clock.  The machine is
+// just out of reset with the emulator stopped, so 128 KB of main RAM can be
+// borrowed (saved and put back).  For wr_setup 0..3, two passes each: a
+// pseudo-random pattern and then its complement (every bit goes 0->1 and
+// 1->0), once back-to-back (FIFO-fed writes, the JIT's normal case) and
+// once 1 us apart (a floated bus between writes, the worst case seen at
+// 16 MHz), then one read-back.  131072 words per tick resolve the ~1e-4
+// loss rate one tick below the edge with a miss chance below 1e-5 (the
+// 16384-word probe of 1.1.2 missed it 19% of the time, docs 55).  Every
+// tick tried is logged and shown on the status page; the first loss-free
+// tick wins and one tick of margin is added (docs 27.13).  Runs with the
+// bus cycle type (slow) already set for this boot and records it.
 static int probe_wr_setup (void)
 {
-    const unsigned n = 16384;
-    static uint16_t save[16384], buf[16384];
-    uint32_t base = emu68k_ram_size () - 2 * n;
+    const unsigned n = 65536;
+    static uint16_t save[65536], buf[65536];
+    // the area must be real DRAM: from 1 MB up is inside every X68000's base
+    // RAM (2 MB minimum); a smaller detection falls back to the top of RAM
+    uint32_t base = emu68k_ram_size () >= 0x100000 + 2 * n ? 0x100000 : emu68k_ram_size () - 2 * n;
+    unsigned t0 = CTimer::Get ()->GetTicks ();
     hw_bus_read_block (base, n, save);
+    for (int i = 0; i < 4; i++) s_probe_bad[i] = 0;
+    s_probe_slow = hw_bus_slow ();
     int chosen = -1;
     for (int st = 0; st < 4 && chosen < 0; st++)
     {
         hw_set_wr_setup (st);
-        for (unsigned i = 0; i < n; i++) { hw_bus_write (base + 2 * i, 1, 0x0000); CTimer::SimpleusDelay (1); }
-        hw_bus_write_sync (base + 2 * (n - 1), 1, 0x0000);
-        for (unsigned i = 0; i < n; i++) { hw_bus_write (base + 2 * i, 1, 0xFFFF); CTimer::SimpleusDelay (1); }
-        hw_bus_write_sync (base + 2 * (n - 1), 1, 0xFFFF);
-        hw_bus_read_block (base, n, buf);
         unsigned bad = 0;
-        for (unsigned i = 0; i < n; i++) if (buf[i] != 0xFFFF) bad++;
-        CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: +%d tick(s): %u/%u words lost", st, bad, n);
+        for (int pass = 0; pass < 2; pass++)
+        {
+            uint16_t seed = (uint16_t) (0x2468 + st * 0x1111 + pass * 0x4321);
+            for (unsigned i = 0; i < n; i++) { hw_bus_write (base + 2 * i, 1, (uint16_t) (i * 0x9E37 + seed)); if (pass) CTimer::SimpleusDelay (1); }
+            hw_bus_write_sync (base + 2 * (n - 1), 1, (uint16_t) ((n - 1) * 0x9E37 + seed));
+            for (unsigned i = 0; i < n; i++) { hw_bus_write (base + 2 * i, 1, (uint16_t) ~(i * 0x9E37 + seed)); if (pass) CTimer::SimpleusDelay (1); }
+            hw_bus_write_sync (base + 2 * (n - 1), 1, (uint16_t) ~((n - 1) * 0x9E37 + seed));
+            hw_bus_read_block (base, n, buf);
+            for (unsigned i = 0; i < n; i++) if (buf[i] != (uint16_t) ~(i * 0x9E37 + seed)) bad++;
+        }
+        s_probe_bad[st] = bad;
+        CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: +%d tick(s): %u/%u words lost (%s-clock cycles)",
+                        st, bad, 2 * n, s_probe_slow ? "5" : "4");
         if (!bad) chosen = st;
     }
+    s_probe_ok = chosen >= 0 ? 1 : 0;
     if (chosen < 0)
     {
-        CLogger::Get ()->Write (FromKernel, LogWarning, "wr_setup probe: main RAM writes lose words even at +3 ticks - keeping 3");
+        CLogger::Get ()->Write (FromKernel, LogWarning, "wr_setup probe: main RAM writes lose words even at +3 ticks - keeping 3 (a try kernel will not be promoted)");
         chosen = 3;
     }
     hw_set_wr_setup (3);
@@ -3228,9 +3389,10 @@ static int probe_wr_setup (void)
     // margin: the probe writes main RAM only; TVRAM byte writes at 16 MHz were seen to
     // lose bits one tick above the first loss-free setting (dots on the text screen),
     // so keep one extra tick when there is room
-    if (chosen >= 0 && chosen < 3)
+    if (s_probe_ok && chosen < 3)
     {
-        CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: using +%d tick(s) (+1 margin)", chosen + 1);
+        CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: using +%d tick(s) (+1 margin), %u ms at $%06X",
+                        chosen + 1, (CTimer::Get ()->GetTicks () - t0) * 1000 / HZ, (unsigned) base);
         chosen++;
     }
     hw_bus_write_sync (base + 2 * (n - 1), 1, save[n - 1]);
@@ -3296,11 +3458,18 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     hw_set_wr_ai (c->ai);
     vmpu68_set_wait_ns (c->wait_ns);
     emu68k_set_io_mhz (c->io_mhz, 0);
+    // bus cycle type, set before the probe (which records it): auto = 4-clock
+    // for every class in 1.1.3 - the 1.0.x bitstream line is clean at 10 MHz
+    // with it (docs clock/regress-log.md); the json 'slow' key or the console
+    // 'slow 1' pins 5-clock cycles
+    int slow_on = (c->slow >= 0 ? c->slow : 0) || s_bus_slow_pref;
+    hw_set_bus_slow (slow_on);
     s_bus_setup_auto = -1;
     int setup = c->wr_setup >= 0 ? hw_set_wr_setup (c->wr_setup) : (s_bus_setup_auto = probe_wr_setup ());
-    CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock %u.%u MHz: class >= %u.%u MHz (%s) - wr_setup +%d%s, wait %u ns, io %u MHz, ai %s",
+    CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock %u.%u MHz: class >= %u.%u MHz (%s) - wr_setup +%d%s, wait %u ns, io %u MHz, ai %s, %s-clock cycles%s",
                     s_bus_mhz10 / 10, s_bus_mhz10 % 10, c->min_mhz10 / 10, c->min_mhz10 % 10, cfg_bus_source (),
-                    setup, c->wr_setup < 0 ? " (probed)" : "", c->wait_ns, c->io_mhz, c->ai ? "on" : "off");
+                    setup, c->wr_setup < 0 ? " (probed)" : "", c->wait_ns, c->io_mhz, c->ai ? "on" : "off",
+                    slow_on ? "5" : "4", s_bus_slow_pref ? " (console)" : c->slow < 0 ? " (auto)" : " (json)");
     emu68k_snoop_apply ();
     unsigned rambad = emu68k_wb_enabled () ? 0 : emu68k_shadow_check ();   // write-back: the real RAM lags the shadow by design
     uint32_t first = ~0u;
@@ -3483,8 +3652,17 @@ TShutdownMode CKernel::Run (void)
         // (the watchdog would have reset it) - promote it to the stable slot
         if (s_ab_arm_promote && m_Timer.GetUptime () >= 20)
         {
-            s_ab_arm_promote = 0;
-            ab_promote ();
+            const char *why = ab_health_block ();
+            if (!why) { s_ab_arm_promote = 0; ab_promote (); }
+            else if (m_Timer.GetUptime () >= 120)
+            {
+                // never seen healthy: put the previous bitstream back, drop the try slot, reboot stable
+                s_ab_arm_promote = 0; s_ab_state = "held back";
+                CLogger::Get ()->Write (FromKernel, LogWarning, "A/B: try '%s' NOT promoted after 120 s: %s - restoring the previous bitstream and rebooting to the stable kernel", s_ab_label, why);
+                f_unlink (AB_MARKER); f_unlink (AB_TRY);
+                FpgaRestorePrev (m_pSerial);
+                pi_reboot (FALSE);
+            }
         }
 
         // deferred actions requested over HTTP (response already sent)

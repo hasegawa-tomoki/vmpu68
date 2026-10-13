@@ -1,4 +1,4 @@
-# vmpu68.pcf — generated from EasyEDA schematic 238d9b08171ea3fe (board 1.2, phase 2)
+# vmpu68-21.pcf — core 1.x/2.0.1 pins (unchanged) + core 2.1 PSRAM and DTACK driver (schematic-core-2.1 4434f3f70d13d1a8)
 # pin 129 is reserved as the top PLL output pad (SB_PLL40_CORE) — do not assign
 set_io clk16 93
 set_io la[1] 88
@@ -91,3 +91,15 @@ set_io pi_ad[12] 115
 set_io pi_ad[13] 116
 set_io pi_ad[14] 142
 set_io pi_ad[15] 117
+# ---- core 2.1: QPI PSRAM (U16/U17 VTI7064) and the DTACK driver Q4 ----
+set_io psram_ce_n[0] 55
+set_io psram_ce_n[1] 110
+set_io psram_sclk 15
+set_io psram_sio[0] 16
+set_io psram_sio[1] 17
+set_io psram_sio[2] 18
+set_io psram_sio[3] 4
+set_io dtack_drv 124
+# ---- core 3.0: riser 3.0 の追加 2 ピン J4(1=DET: +5V→R23 1k、2=MODE: FPGA 出力、L=VMPU68 / H=MC68000) ----
+# RTL に mode 出力ポートを追加したら有効にする(未接続の set_io は PnR を止めるので今はコメント)
+# set_io -pullup no mode 84

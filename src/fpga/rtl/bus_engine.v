@@ -229,6 +229,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     // speculative fetches are not "busy" for the Pi: it waits on pf_count
     assign busy = cmd_rdy || (exec_busy && !p_spec) || start;
 
+    reg         snoop_push;         // declared before the initial block below (iverilog needs declaration before use)
     initial begin
         own = 1'b1; bg_n = 1'b1;
         as_n_o = 1'b1; uds_n_o = 1'b1; lds_n_o = 1'b1; rw_o = 1'b1;
@@ -239,7 +240,6 @@ module bus_engine #(parameter SNOOP_AW = 9) (
 
     // ---- snoop FIFO ----
     reg  [47:0] snoop_din;
-    reg         snoop_push;
     wire snoop_afull, snoop_full, snq_rdy, snq_pop;
     wire [47:0] snq_rec;
     // grant DMA only with room for a whole burst (X68000 DMAC bursts a
@@ -307,6 +307,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
         end
         if (snoop_drop || snoop_rst) last_ok <= 1'b0;
     end
+    reg [47:0] snoop_hold;          // (declared here: used by snoop_cont before the capture block)
     wire snoop_cont = last_ok && snoop_hold[45] && snoop_hold[44] &&
                       (snoop_hold[43:21] == last_a + 23'd1);
 
@@ -341,7 +342,6 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     wire cyc_s    = ~as_s[1] & ~(uds_s[1] & lds_s[1]);   // strobed cycle, synchronised
     wire cyc_prev = ~as_s[2] & ~(uds_s[2] & lds_s[2]);
     wire cyc_end  = cyc_prev & ~cyc_s;
-    reg [47:0] snoop_hold;
     reg        snoop_wr;
     reg [1:0]  cyc_n;                                   // in-cycle samples - 1, saturating
     always @(posedge clk) begin
@@ -448,7 +448,10 @@ module bus_engine #(parameter SNOOP_AW = 9) (
             ld_o     <= p_word ? p_wdata : {p_wdata[7:0], p_wdata[7:0]};
             d_dir    <= 1'b1;
             ld_drive <= 1'b1;
-            st <= slow ? ST_WEN : ST_ADDR1;
+            // wr_setup ticks of data before AS apply to the 4-clock cycle too: without them the
+            // 16 MHz main RAM lost about 1 word in 10000 (bits dropped; X68000-side WRTEST,
+            // docs 55) - the 0.1.13 margin had only survived on the slow (5-clock) path.
+            st <= (slow || wr_setup != 2'd0) ? ST_WEN : ST_ADDR1;
         end
 
         ST_WEN: begin

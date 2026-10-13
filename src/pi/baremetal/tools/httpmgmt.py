@@ -83,7 +83,9 @@ def main():
                 u = get(host, "/api/status").get("update", {})
             except Exception:
                 down += 1
-                if last == "reboot":
+                # a fast install (bitstream unchanged) reboots before the first
+                # poll sees any phase: treat "no phase seen yet" like "reboot"
+                if last in ("reboot", None):
                     print(f"  rebooting... {down}s", end="\r")
                     if down > 180:
                         raise SystemExit("no answer after reboot")
@@ -91,6 +93,11 @@ def main():
                 if down > 5:
                     raise SystemExit("connection lost")
                 continue
+            if last is None and u.get("phase") == "idle":
+                j = get(host, "/api/status")
+                if j.get("uptime", 999) < 60:          # already rebooted and back
+                    print(f"\nback: {j.get('version')} (uptime {j.get('uptime')}s)")
+                    break
             # back after the reboot: phase is "reboot" only until the board
             # actually restarts, and a slow poll (timeout) can miss it, so
             # also accept "idle" once any install phase has been seen

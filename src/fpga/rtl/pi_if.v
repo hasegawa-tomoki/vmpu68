@@ -173,6 +173,7 @@ module pi_if (
                             // Set during the strobe rather than sampled at its start: the
                             // host's RD# can reach us before the command strobe that
                             // precedes it has been synchronised and pushed (~80 ns).
+    reg rd_avail;       // snoop_avail as sampled at the start of the current read strobe
     always @(posedge clk) begin
         if (!pi_wr_n && wr_s[1]) begin ad_in <= pi_ad; ra_wr <= pi_reg_a; end
         if (!pi_rd_n && rd_s[1]) begin
@@ -200,7 +201,6 @@ module pi_if (
     reg [3:0] rst_cnt;
     reg cyc_wait;       // CTRL bit11 (wt): the Pi waits for this command
     reg snoop2;         // REG3 bit13: snoop stream v2 (valid-gated HI, continuation records)
-    reg rd_avail;       // snoop_avail as sampled at the start of the current read strobe
     reg cyc_ai;         // CTRL bit15 (ai): REG0 write starts a write cycle, address auto-advances
     wire ai_wr = cyc_ai && !cyc_rw;
     reg busy_d;

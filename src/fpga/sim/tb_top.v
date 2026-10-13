@@ -12,6 +12,7 @@
 `default_nettype none
 
 module tb_top;
+    integer errors = 0;
 
     // ---------------- clock ----------------
     reg clk16 = 0;
@@ -115,7 +116,6 @@ module tb_top;
     );
 
     // ---------------- Pi bus tasks ----------------
-    integer errors = 0;
 
     // AS-to-AS spacing monitor (bus cycle length seen by the motherboard)
     reg mon_as = 0;

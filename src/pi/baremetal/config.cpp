@@ -177,8 +177,8 @@ static const char *s_BusSource = "built-in";
 static void bus_defaults (void)
 {
     s_BusN = 2;
-    s_Bus[0] = { 0,   -1, 500, 10, 1 };        // 10 MHz machines
-    s_Bus[1] = { 130, -1, 500, 16, 1 };        // XVI at 16 MHz: wr_setup probed (2 in practice)
+    s_Bus[0] = { 0,   -1, 500, 10, 1, -1 };    // 10 MHz machines
+    s_Bus[1] = { 130, -1, 500, 16, 1, -1 };    // XVI at 16 MHz: wr_setup probed (2 in practice)
     s_BusSource = "built-in";
 }
 
@@ -197,7 +197,7 @@ static const char *parse_num10 (const char *p, unsigned *out, int tenths)   // 1
 }
 static int parse_class (const char *p, const char **end, cfg_bus_class *c)
 {
-    *c = { 0, -1, 500, 10, 1 };
+    *c = { 0, -1, 500, 10, 1, -1 };
     int have_min = 0;
     p = skip_ws (p);
     if (*p != '{') return 0;
@@ -237,6 +237,7 @@ static int parse_class (const char *p, const char **end, cfg_bus_class *c)
         else if (klen == 7 && strncmp (k, "wait_ns", 7) == 0)  c->wait_ns = num;
         else if (klen == 6 && strncmp (k, "io_mhz", 6) == 0)   c->io_mhz = num;
         else if (klen == 2 && strncmp (k, "ai", 2) == 0)       c->ai = is_true ? 1 : is_false ? 0 : (num != 0);
+        else if (klen == 4 && strncmp (k, "slow", 4) == 0)     c->slow = is_auto ? -1 : is_true ? 1 : is_false ? 0 : (num != 0);
         // unknown keys are ignored
     }
 }
