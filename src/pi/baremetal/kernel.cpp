@@ -3378,18 +3378,32 @@ static int probe_wr_setup (void)
                         st, bad, 2 * n, s_probe_slow ? "5" : "4");
         if (!bad) chosen = st;
     }
-    s_probe_ok = chosen >= 0 ? 1 : 0;
+    // no loss-free tick: take the one that lost least (the later on a tie).
+    // A board can be marginal at its best setting - core 1.0 at 16.7 MHz
+    // keeps 1-2 words in 131072 at +2/+3 (1.1.2 lost 250 there, docs 56.3) -
+    // so the A/B health check tolerates a residual of 4 words (3e-5) and only
+    // refuses a bitstream that loses words the way 1.1.2 did (7+ per 131072).
     if (chosen < 0)
     {
-        CLogger::Get ()->Write (FromKernel, LogWarning, "wr_setup probe: main RAM writes lose words even at +3 ticks - keeping 3 (a try kernel will not be promoted)");
-        chosen = 3;
+        unsigned best = ~0u;
+        for (int i = 0; i < 4; i++) if (s_probe_bad[i] <= best) { best = s_probe_bad[i]; chosen = i; }
+        CLogger::Get ()->Write (FromKernel, best <= 4 ? LogNotice : LogWarning,
+                        "wr_setup probe: no loss-free setting - using +%d (%u/%u lost%s)", chosen, best, 2 * n,
+                        best <= 4 ? ", residual tolerated" : " - a try kernel will not be promoted");
+        s_probe_ok = best <= 4 ? 1 : 0;
+        hw_set_wr_setup (3);
+        for (unsigned i = 0; i < n; i++) hw_bus_write (base + 2 * i, 1, save[i]);
+        hw_bus_write_sync (base + 2 * (n - 1), 1, save[n - 1]);
+        hw_set_wr_setup (chosen);
+        return chosen;
     }
+    s_probe_ok = 1;
     hw_set_wr_setup (3);
     for (unsigned i = 0; i < n; i++) hw_bus_write (base + 2 * i, 1, save[i]);
     // margin: the probe writes main RAM only; TVRAM byte writes at 16 MHz were seen to
     // lose bits one tick above the first loss-free setting (dots on the text screen),
     // so keep one extra tick when there is room
-    if (s_probe_ok && chosen < 3)
+    if (chosen < 3)
     {
         CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: using +%d tick(s) (+1 margin), %u ms at $%06X",
                         chosen + 1, (CTimer::Get ()->GetTicks () - t0) * 1000 / HZ, (unsigned) base);
@@ -3662,6 +3676,9 @@ TShutdownMode CKernel::Run (void)
                 s_ab_arm_promote = 0; s_ab_state = "held back";
                 CLogger::Get ()->Write (FromKernel, LogWarning, "A/B: try '%s' NOT promoted after 120 s: %s - restoring the previous bitstream and rebooting to the stable kernel", s_ab_label, why);
                 f_unlink (AB_MARKER); f_unlink (AB_TRY);
+#ifdef VMPU68_WITH_EMU
+                emu_quiesce ();                // the flash is bit-banged on the shared GPIO: core 1 must be off the bus
+#endif
                 FpgaRestorePrev (m_pSerial);
                 pi_reboot (FALSE);
             }
