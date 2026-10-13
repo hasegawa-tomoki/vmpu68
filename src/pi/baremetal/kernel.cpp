@@ -64,7 +64,7 @@ static unsigned s_bus_mhz10;                   // measured bus clock in 0.1 MHz 
 static const cfg_bus_class *s_bus_cls;         // the timing class in use (config.h)
 static int s_bus_setup_auto = -1;              // wr_setup found by the boot probe (-1 = not probed)
 static int s_bus_slow_pref = 0;                // console 'slow 1': 5-clock bus cycles, kept across every BootX68 (diagnostics)
-static unsigned s_probe_bad[4];                // boot probe: words lost at wr_setup +0..+3 (131072-word samples, both bit directions)
+static unsigned s_probe_bad[8];                // boot probe: words lost at wr_setup +0..+7 (131072-word samples, both bit directions; +4..+7 need FPGA 1.0.1)
 static int s_probe_ok = -1;                    // -1 not probed, 1 a loss-free setting was found, 0 losses at every setting (A/B health)
 static int s_probe_slow = -1;                  // bus cycle type the probe ran with (0 = 4-clock, 1 = 5-clock)
 static const char *probed_str (void);          // " (probed: n)" for bcls
@@ -788,6 +788,41 @@ static u32 file_sum_range (FIL *f, u32 off, u32 len, boolean *pOK);   // fwd (de
 // the next boot is stable (tryboot is one-shot) and reads 1 -> 2 (the try did
 // not stick: roll back).  Self-identification is not needed - the counter
 // carries it.  Promotion copies kernel8-try.img over kernel8-rpi4.img.
+// The build string embedded in this kernel.  A marker written by "upd try"
+// carries the try kernel's (scanned out of the package), so that a stable
+// boot after a try that never ran - power cycled before the one-shot
+// tryboot took, or the try crashed before writing anything - is not
+// mistaken for the try boot and does not promote the broken try (docs 56.5).
+static const char s_build_sig[] __attribute__ ((used)) = "VMPU68-BUILD:" VMPU68_BUILD;
+static void build_norm (const char *in, char *out, unsigned outlen)   // spaces -> '_' (one token in the marker)
+{
+    unsigned n = 0;
+    while (in[n] && n + 1 < outlen) { out[n] = in[n] == ' ' ? '_' : in[n]; n++; }
+    out[n] = 0;
+}
+static boolean file_find_build (const char *path, u32 off, u32 len, char *out, unsigned outlen)
+{
+    char key[16]; strcpy (key, "VMPU68-"); strcat (key, "BUILD:");   // assembled at run time: the literal must not appear in the image
+    const unsigned KL = 13, CH = 8192, OV = 64;
+    static u8 buf[8192 + 64];
+    FIL f; UINT br; boolean found = FALSE;
+    if (f_open (&f, path, FA_READ) != FR_OK) return FALSE;
+    for (u32 a = off; a < off + len && !found; a += CH)
+    {
+        if (f_lseek (&f, a) != FR_OK) break;
+        UINT want = off + len - a > CH + OV ? CH + OV : off + len - a;
+        if (f_read (&f, buf, want, &br) != FR_OK) break;
+        for (UINT i = 0; i < CH && i + KL < br; i++)
+            if (buf[i] == 'V' && memcmp (buf + i, key, KL) == 0)
+            {
+                const u8 *q = buf + i + KL; unsigned n = 0;
+                while (n + 1 < outlen && i + KL + n < br && q[n] >= ' ') { out[n] = q[n] == ' ' ? '_' : (char) q[n]; n++; }
+                out[n] = 0; found = n > 0; break;
+            }
+    }
+    f_close (&f);
+    return found;
+}
 #define AB_MARKER "SD:/tryboot.pending"
 #define AB_STABLE "SD:/kernel8-rpi4.img"
 #define AB_TRY    "SD:/kernel8-try.img"
@@ -803,10 +838,12 @@ static u32 file_sum_path (const char *path)
     boolean ok; u32 s = file_sum_range (&f, 0, f_size (&f), &ok); f_close (&f);
     return ok ? s : 0;
 }
-static void ab_write_marker (unsigned count, u32 trysum, const char *label)
+static void ab_write_marker (unsigned count, u32 trysum, const char *label, const char *build)
 {
     FIL f; if (f_open (&f, AB_MARKER, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) return;
-    CString L; L.Format ("%u %08X %s\n", count, (unsigned) trysum, label ? label : "");
+    CString L;
+    if (build && build[0]) L.Format ("%u %08X b=%s %s\n", count, (unsigned) trysum, build, label ? label : "");
+    else                   L.Format ("%u %08X %s\n", count, (unsigned) trysum, label ? label : "");
     UINT bw; f_write (&f, (const char *) L, L.GetLength (), &bw); f_sync (&f); f_close (&f);
 }
 // Copy a small text file (fpga.sum lines); FALSE when the source is absent
@@ -834,8 +871,19 @@ static int ab_boot_check (void)
         if (c >= '0' && c <= '9') d = c - '0'; else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
         else if (c >= 'a' && c <= 'f') d = c - 'a' + 10; else break; trysum = trysum * 16 + d; q++; }
     while (*q == ' ') q++;
+    char build[32] = "";
+    if (q[0] == 'b' && q[1] == '=') { q += 2; unsigned n = 0; while (*q && *q != ' ' && *q != '\r' && *q != '\n' && n + 1 < sizeof build) build[n++] = *q++; build[n] = 0; while (*q == ' ') q++; }
     { unsigned n = 0; while (*q && *q != '\r' && *q != '\n' && n + 1 < sizeof label) label[n++] = *q++; label[n] = 0; }
     strncpy (s_ab_label, label, sizeof s_ab_label - 1); s_ab_label[sizeof s_ab_label - 1] = 0;
+    char mine[32]; build_norm (VMPU68_BUILD, mine, sizeof mine);
+    if (count == 0 && build[0] && strcmp (build, mine) != 0)
+    {
+        // first boot after the install, but this is not the try kernel: the try never ran
+        f_unlink (AB_MARKER); f_unlink (AB_TRY);
+        s_ab_state = "rolled back";
+        CLogger::Get ()->Write (FromKernel, LogWarning, "A/B: try '%s' (build %s) never booted - this is %s; rolled back to stable", label, build, mine);
+        return 2;
+    }
 
     if (trysum == file_sum_path (AB_STABLE))    // already promoted (or identical): clean up
     {
@@ -850,7 +898,7 @@ static int ab_boot_check (void)
         CLogger::Get ()->Write (FromKernel, LogWarning, "A/B: try '%s' did not boot cleanly - rolled back to stable", label);
         return 2;
     }
-    ab_write_marker (count, trysum, label);     // count == 1: this is the try boot
+    ab_write_marker (count, trysum, label, build);     // count == 1: this is the try boot
     s_ab_arm_promote = 1; s_ab_state = "try";
     CLogger::Get ()->Write (FromKernel, LogNotice, "A/B: running try kernel '%s' - promote after health check", label);
     return 1;
@@ -951,6 +999,51 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
             if (v != want) { bad++; if (first == ~0u) { first = a + 2 * i; got0 = v; want0 = want; } }
         }
         R.Format ("chk %06X x%u seed %u: bad=%u faults=%u first@%06X got %04X want %04X\r\n", a, n, seed, bad, faults, first, got0, want0);
+    }
+    else if (p[0] == 'd' && p[1] == 'm' && p[2] == 'a' && p[3] == 'w')   // dmaw <src> <dst> <words> <seed> [c]: the Pi fills src (WRTEST's pattern), DMAC ch2 copies it to dst, mismatches are classified: Pi write lost (real src wrong) / DMAC copy wrong (real dst wrong) / snoop wrong (shadow dst wrong).  Run with the emulator running (the snoop FIFO must drain, docs 55.2)
+    {
+        p += 4;
+        unsigned src = parse_num (p) & 0xFFFFFE, dst = parse_num (p) & 0xFFFFFE, n = parse_num (p), seed = parse_num (p);
+        while (*p == ' ') p++;
+        int cs = (*p == 'c');
+        if (n == 0 || n > 32768) n = 32768;
+        uint16_t *bs = (uint16_t *) malloc (2 * n), *bd = (uint16_t *) malloc (2 * n);
+        if (!bs || !bd) { free (bs); free (bd); R = "dmaw: no memory\r\n"; }
+        else {
+        for (unsigned i = 0; i < n; i++) hw_bus_write (src + 2 * i, 1, (uint16_t) (i * 0x9E37u + seed * 0x1111u + 0x2468u));
+        hw_wq_sync ();
+        const unsigned CH = 0xE84080u;                     // HD63450 channel 2 (the user channel, IOCS _DMAMOVE)
+        hw_bus_write (CH + 0x00, 0, 0xFF);                 // CSR: clear
+        hw_bus_write (CH + 0x04, 0, cs ? 0x88 : 0x08);     // DCR: cycle steal / burst, 68000 dual-address, 16-bit port
+        hw_bus_write (CH + 0x05, 0, cs ? 0x10 : 0x11);     // OCR: memory -> device, word, auto-request (limited / max rate)
+        hw_bus_write (CH + 0x06, 0, 0x05);                 // SCR: MAR++, DAR++
+        hw_bus_write (CH + 0x0A, 1, (uint16_t) n);
+        hw_bus_write (CH + 0x0C, 1, (uint16_t) (src >> 16)); hw_bus_write (CH + 0x0E, 1, (uint16_t) src);
+        hw_bus_write (CH + 0x14, 1, (uint16_t) (dst >> 16)); hw_bus_write (CH + 0x16, 1, (uint16_t) dst);
+        hw_bus_write (CH + 0x29, 0, 0x05); hw_bus_write (CH + 0x31, 0, 0x05); hw_bus_write (CH + 0x2D, 0, 0x03);
+        hw_bus_write (CH + 0x07, 0, 0x80);                 // CCR: STR
+        uint16_t csr = 0; unsigned polls = 0;
+        do { CTimer::SimpleusDelay (200); hw_bus_read (CH + 0x00, 0, &csr); polls++; } while (!(csr & 0x80) && polls < 50000);
+        uint16_t cer = 0; hw_bus_read (CH + 0x01, 0, &cer);
+        CTimer::SimpleusDelay (20000);                     // let the snoop records reach the shadow
+        hw_bus_read_block (src, n, bs);
+        hw_bus_read_block (dst, n, bd);
+        emu_ensure ();
+        unsigned e[3] = {0, 0, 0}, f[3] = {~0u, ~0u, ~0u}; uint16_t g[3] = {0, 0, 0}, w[3] = {0, 0, 0};
+        for (unsigned i = 0; i < n; i++)
+        {
+            uint16_t want = (uint16_t) (i * 0x9E37u + seed * 0x1111u + 0x2468u);
+            uint16_t sr = bs[i], dr = bd[i], sh = (uint16_t) emu68k_peek16 (dst + 2 * i);
+            int k = sr != want ? 0 : dr != want ? 1 : sh != want ? 2 : -1;
+            if (k < 0) continue;
+            e[k]++;
+            if (f[k] == ~0u) { f[k] = (k == 0 ? src : dst) + 2 * i; g[k] = k == 0 ? sr : k == 1 ? dr : sh; w[k] = want; }
+        }
+        R.Format ("dmaw %06X -> %06X x%u seed %u (%s): CSR %02X CER %02X | Pi write lost %u (first %06X got %04X want %04X) | DMAC copy wrong %u (first %06X got %04X want %04X) | snoop wrong %u (first %06X got %04X want %04X)\r\n",
+                  src, dst, n, seed, cs ? "cycle steal" : "burst", csr & 0xFF, cer & 0xFF,
+                  e[0], f[0], g[0], w[0], e[1], f[1], g[1], w[1], e[2], f[2], g[2], w[2]);
+        free (bs); free (bd);
+        }
     }
     else if (p[0] == 'l' && p[1] == 'e')                   // led <0-7> | led auto: hold a colour (bit2=R bit1=G bit0=B) / back to the status ladder
     {
@@ -3144,7 +3237,11 @@ boolean CKernel::Update (CDevice *pDev, const char *pPath, boolean bTry, boolean
         }
     }
     if (bTry)
-        ab_write_marker (0, h.kernel_sum, h.label);   // A/B: boot ordinal 0; the try boot bumps it to 1
+    {
+        char tb[32] = "";
+        if (!file_find_build (pPath, h.kernel_off, h.kernel_len, tb, sizeof tb)) tb[0] = 0;   // older packages: no signature -> counter semantics only
+        ab_write_marker (0, h.kernel_sum, h.label, tb);   // A/B: boot ordinal 0; the try boot bumps it to 1 (and checks the build)
+    }
     else
     { f_unlink (AB_MARKER); f_unlink (AB_TRY); }       // direct install supersedes any pending try
     f_unlink (pPath);                          // installed: drop the package
@@ -3350,16 +3447,18 @@ static unsigned measure_bus_mhz10 (void)
 static int probe_wr_setup (void)
 {
     const unsigned n = 65536;
-    static uint16_t save[65536], buf[65536];
+    uint16_t *save = (uint16_t *) malloc (2 * n), *buf = (uint16_t *) malloc (2 * n);   // 256 KB from the heap (static arrays pushed the kernel over its 4.5 MB region)
+    if (!save || !buf) { free (save); free (buf); CLogger::Get ()->Write (FromKernel, LogError, "wr_setup probe: no memory - using +3"); hw_set_wr_setup (3); s_probe_ok = -1; return 3; }
     // the area must be real DRAM: from 1 MB up is inside every X68000's base
     // RAM (2 MB minimum); a smaller detection falls back to the top of RAM
     uint32_t base = emu68k_ram_size () >= 0x100000 + 2 * n ? 0x100000 : emu68k_ram_size () - 2 * n;
     unsigned t0 = CTimer::Get ()->GetTicks ();
     hw_bus_read_block (base, n, save);
-    for (int i = 0; i < 4; i++) s_probe_bad[i] = 0;
+    for (int i = 0; i < 8; i++) s_probe_bad[i] = 0;
+    const int maxst = 3;                   // REG3 has no free bit for a 4th wr_setup bit (bit2 = flags_clr): 0..3
     s_probe_slow = hw_bus_slow ();
     int chosen = -1;
-    for (int st = 0; st < 4 && chosen < 0; st++)
+    for (int st = 0; st <= maxst && chosen < 0; st++)
     {
         hw_set_wr_setup (st);
         unsigned bad = 0;
@@ -3386,24 +3485,25 @@ static int probe_wr_setup (void)
     if (chosen < 0)
     {
         unsigned best = ~0u;
-        for (int i = 0; i < 4; i++) if (s_probe_bad[i] <= best) { best = s_probe_bad[i]; chosen = i; }
+        for (int i = 0; i <= maxst; i++) if (s_probe_bad[i] <= best) { best = s_probe_bad[i]; chosen = i; }
         CLogger::Get ()->Write (FromKernel, best <= 4 ? LogNotice : LogWarning,
                         "wr_setup probe: no loss-free setting - using +%d (%u/%u lost%s)", chosen, best, 2 * n,
                         best <= 4 ? ", residual tolerated" : " - a try kernel will not be promoted");
         s_probe_ok = best <= 4 ? 1 : 0;
-        hw_set_wr_setup (3);
+        hw_set_wr_setup (maxst);
         for (unsigned i = 0; i < n; i++) hw_bus_write (base + 2 * i, 1, save[i]);
         hw_bus_write_sync (base + 2 * (n - 1), 1, save[n - 1]);
         hw_set_wr_setup (chosen);
+        free (save); free (buf);
         return chosen;
     }
     s_probe_ok = 1;
-    hw_set_wr_setup (3);
+    hw_set_wr_setup (maxst);
     for (unsigned i = 0; i < n; i++) hw_bus_write (base + 2 * i, 1, save[i]);
     // margin: the probe writes main RAM only; TVRAM byte writes at 16 MHz were seen to
     // lose bits one tick above the first loss-free setting (dots on the text screen),
     // so keep one extra tick when there is room
-    if (chosen < 3)
+    if (chosen < maxst)
     {
         CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: using +%d tick(s) (+1 margin), %u ms at $%06X",
                         chosen + 1, (CTimer::Get ()->GetTicks () - t0) * 1000 / HZ, (unsigned) base);
@@ -3411,6 +3511,7 @@ static int probe_wr_setup (void)
     }
     hw_bus_write_sync (base + 2 * (n - 1), 1, save[n - 1]);
     hw_set_wr_setup (chosen);
+    free (save); free (buf);
     return chosen;
 }
 
