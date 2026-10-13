@@ -59,8 +59,6 @@ def main():
     host, cmd = sys.argv[1], sys.argv[2]
     if cmd == "status":
         print(json.dumps(get(host, "/api/status"), indent=1))
-    elif cmd == "sum":                   # sum <file>: the checksum the board's 'ab' console command shows
-        print(f"{checksum(open(sys.argv[3], 'rb').read()):08X}")
     elif cmd == "put":
         upload(host, open(sys.argv[3], "rb").read(), sys.argv[4])
     elif cmd == "fw":
@@ -74,30 +72,20 @@ def main():
         upload(host, open(sys.argv[3], "rb").read(), "SD:/update.vpk")
         mode = "try" if "try" in sys.argv[4:] else "stable"
         force = 1 if "force" in sys.argv[4:] else 0
-        try:
-            uptime0 = int(get(host, "/api/status").get("uptime", 0))
-        except Exception:
-            uptime0 = 0
         r = get(host, f"/api/update?mode={mode}&force={force}")
         print(r)
         if not r.get("ok"):
             raise SystemExit(1)
         last, down = None, 0
-        t_start = time.time()
         while True:
             time.sleep(1)
-            if time.time() - t_start > 180:
-                raise SystemExit("update: no reboot seen in 180 s")
             try:
-                j0 = get(host, "/api/status")
-                u = j0.get("update", {})
-                # the board came back from the reboot (uptime restarted): done, whatever phase we managed to see
-                if uptime0 and 0 < int(j0.get("uptime", 0)) < uptime0 and int(j0.get("uptime", 0)) < time.time() - t_start + 5:
-                    print(f"\nback: {j0.get('version')} (uptime {j0.get('uptime')}s, {int(time.time() - t_start)} s after the update started)")
-                    break
+                u = get(host, "/api/status").get("update", {})
             except Exception:
                 down += 1
-                if last == "reboot":
+                # a fast install (bitstream unchanged) reboots before the first
+                # poll sees any phase: treat "no phase seen yet" like "reboot"
+                if last in ("reboot", None):
                     print(f"  rebooting... {down}s", end="\r")
                     if down > 180:
                         raise SystemExit("no answer after reboot")
@@ -105,6 +93,11 @@ def main():
                 if down > 5:
                     raise SystemExit("connection lost")
                 continue
+            if last is None and u.get("phase") == "idle":
+                j = get(host, "/api/status")
+                if j.get("uptime", 999) < 60:          # already rebooted and back
+                    print(f"\nback: {j.get('version')} (uptime {j.get('uptime')}s)")
+                    break
             # back after the reboot: phase is "reboot" only until the board
             # actually restarts, and a slow poll (timeout) can miss it, so
             # also accept "idle" once any install phase has been seen
