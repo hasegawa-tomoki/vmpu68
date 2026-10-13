@@ -2588,7 +2588,7 @@ static void fpga_version_fixup (void)
             { 0x83F73070, 0x000100 }, { 0x9610EB35, 0x000101 }, { 0x016736A9, 0x000102 }, { 0xCE273913, 0x000103 },
             { 0x4A3402A2, 0x000105 }, { 0x60AFBB62, 0x000106 }, { 0x8B345498, 0x000107 }, { 0x6EE83BCE, 0x000108 },
             { 0xA54FC955, 0x000109 }, { 0x6714AB36, 0x00010D }, { 0xF2B1BAC5, 0x000111 }, { 0x64DA5713, 0x010000 },   // 1.0.0 (same bitstream as 0.1.18)
-            { 0xBBA7FA40, 0x010001 },   // 1.0.1 (1.1.3: write-data setup applied to 4-clock cycles too, docs 55)
+            { 0x4A6E0D82, 0x010001 },   // 1.0.1 (1.1.3: write-data setup applied to 4-clock cycles too, docs 55; slow=1 ends writes on tick16, docs 56)
         };
         for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) if (known[i].sum == sum && len == 135100) { flags = known[i].ver; from = "release table"; }
     }
@@ -3458,11 +3458,13 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     hw_set_wr_ai (c->ai);
     vmpu68_set_wait_ns (c->wait_ns);
     emu68k_set_io_mhz (c->io_mhz, 0);
-    // bus cycle type, set before the probe (which records it): auto = 4-clock
-    // for every class in 1.1.3 - the 1.0.x bitstream line is clean at 10 MHz
-    // with it (docs clock/regress-log.md); the json 'slow' key or the console
-    // 'slow 1' pins 5-clock cycles
-    int slow_on = (c->slow >= 0 ? c->slow : 0) || s_bus_slow_pref;
+    // bus cycle type, set before the probe (which records it).  auto: 5-clock
+    // cycles below 13 MHz, 4-clock above.  At 10 MHz the 4-clock VRAM access
+    // depends on the placement of the bitstream: 1.0.0 was clean, 1.0.1 (one
+    // line of logic away, identical at wr_setup 0) lost Pi->VRAM writes and
+    // read VRAM unstably, 5-clock cycles were clean on every build (docs 56).
+    // The json 'slow' key or the console 'slow 1' pins it either way.
+    int slow_on = (c->slow >= 0 ? c->slow : (c->min_mhz10 < 130)) || s_bus_slow_pref;
     hw_set_bus_slow (slow_on);
     s_bus_setup_auto = -1;
     int setup = c->wr_setup >= 0 ? hw_set_wr_setup (c->wr_setup) : (s_bus_setup_auto = probe_wr_setup ());

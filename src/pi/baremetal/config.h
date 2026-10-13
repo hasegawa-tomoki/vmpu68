@@ -47,7 +47,7 @@ struct cfg_bus_class
     unsigned wait_ns;
     unsigned io_mhz;
     int      ai;
-    int      slow;                      // bus cycle: -1 = auto (4-clock in 1.1.3: the 1.0.x bitstream line is clean at 10 MHz too), 0 = 4-clock, 1 = 5-clock
+    int      slow;                      // bus cycle: -1 = auto (5-clock below 13 MHz, 4-clock above; docs 56), 0 = 4-clock, 1 = 5-clock
 };
 void cfg_bus_load (void);               // (re)read the file; defaults when absent/invalid
 unsigned cfg_bus_count (void);
