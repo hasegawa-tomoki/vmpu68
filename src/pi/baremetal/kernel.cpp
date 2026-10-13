@@ -1025,23 +1025,46 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         uint16_t csr = 0; unsigned polls = 0;
         do { CTimer::SimpleusDelay (200); hw_bus_read (CH + 0x00, 0, &csr); polls++; } while (!(csr & 0x80) && polls < 50000);
         uint16_t cer = 0; hw_bus_read (CH + 0x01, 0, &cer);
-        CTimer::SimpleusDelay (20000);                     // let the snoop records reach the shadow
+        CTimer::SimpleusDelay (300000);                    // let the snoop records reach the shadow (20 ms left the tail of a 64 KB burst unprocessed, docs 56.4)
         hw_bus_read_block (src, n, bs);
         hw_bus_read_block (dst, n, bd);
         emu_ensure ();
-        unsigned e[3] = {0, 0, 0}, f[3] = {~0u, ~0u, ~0u}; uint16_t g[3] = {0, 0, 0}, w[3] = {0, 0, 0};
+        // classes: 0 Pi write lost (src wrong on a single read too), 1 block-read wrong (src wrong in the
+        // block read but right on a single read: the prefetch stream, not the write), 2 DMAC copy wrong,
+        // 3 snoop wrong (shadow).  Each first case also shows the real dst (what the DMAC copied).
+        unsigned e[4] = {0, 0, 0, 0}, f[4] = {~0u, ~0u, ~0u, ~0u}; uint16_t g[4] = {0, 0, 0, 0}, w[4] = {0, 0, 0, 0}, x[4] = {0, 0, 0, 0};
+        CString ctx; unsigned ctxn = 0;
         for (unsigned i = 0; i < n; i++)
         {
             uint16_t want = (uint16_t) (i * 0x9E37u + seed * 0x1111u + 0x2468u);
             uint16_t sr = bs[i], dr = bd[i], sh = (uint16_t) emu68k_peek16 (dst + 2 * i);
-            int k = sr != want ? 0 : dr != want ? 1 : sh != want ? 2 : -1;
+            int k = -1; uint16_t got = 0, extra = dr;
+            if (sr != want)
+            {
+                uint16_t sr2 = 0; hw_bus_read (src + 2 * i, 1, &sr2);       // single (non-stream) read of the same word
+                k = sr2 != want ? 0 : 1; got = k == 0 ? sr2 : sr; extra = dr;
+            }
+            else if (dr != want) { k = 2; got = dr; extra = sh; }
+            else if (sh != want) { k = 3; got = sh; extra = dr; }
             if (k < 0) continue;
             e[k]++;
-            if (f[k] == ~0u) { f[k] = (k == 0 ? src : dst) + 2 * i; g[k] = k == 0 ? sr : k == 1 ? dr : sh; w[k] = want; }
+            if (f[k] == ~0u) { f[k] = (k <= 1 ? src : dst) + 2 * i; g[k] = got; w[k] = want; x[k] = extra; }
+            if (k <= 1 && ctxn < 4)
+            {
+                // context for the write-side classes: the neighbours (real / wanted) and whether the word
+                // kept the previous run's value (seed - 1 = what was there before this fill)
+                uint16_t old = (uint16_t) (i * 0x9E37u + (seed - 1) * 0x1111u + 0x2468u);
+                uint16_t pv = i ? bs[i - 1] : 0, pw = i ? (uint16_t) ((i - 1) * 0x9E37u + seed * 0x1111u + 0x2468u) : 0;
+                uint16_t nv = i + 1 < n ? bs[i + 1] : 0, nw = i + 1 < n ? (uint16_t) ((i + 1) * 0x9E37u + seed * 0x1111u + 0x2468u) : 0;
+                CString X; X.Format ("  ctx[%u] %06X: got %04X want %04X old %04X%s | prev %04X/%04X next %04X/%04X | i=%u (i%%16=%u)\r\n",
+                                     k, src + 2 * i, got, want, old, got == old ? " (=old: write lost)" : "", pv, pw, nv, nw, i, i % 16);
+                ctx.Append ((const char *) X); ctxn++;
+            }
         }
-        R.Format ("dmaw %06X -> %06X x%u seed %u (%s): CSR %02X CER %02X | Pi write lost %u (first %06X got %04X want %04X) | DMAC copy wrong %u (first %06X got %04X want %04X) | snoop wrong %u (first %06X got %04X want %04X)\r\n",
+        R.Format ("dmaw %06X -> %06X x%u seed %u (%s): CSR %02X CER %02X | Pi write lost %u (first %06X got %04X want %04X, dst %04X) | block-read wrong %u (first %06X stream %04X want %04X, dst %04X) | DMAC copy wrong %u (first %06X got %04X want %04X, shadow %04X) | snoop wrong %u (first %06X got %04X want %04X, dst %04X)\r\n",
                   src, dst, n, seed, cs ? "cycle steal" : "burst", csr & 0xFF, cer & 0xFF,
-                  e[0], f[0], g[0], w[0], e[1], f[1], g[1], w[1], e[2], f[2], g[2], w[2]);
+                  e[0], f[0], g[0], w[0], x[0], e[1], f[1], g[1], w[1], x[1], e[2], f[2], g[2], w[2], x[2], e[3], f[3], g[3], w[3], x[3]);
+        R.Append ((const char *) ctx);
         free (bs); free (bd);
         }
     }
@@ -2681,7 +2704,7 @@ static void fpga_version_fixup (void)
             { 0x83F73070, 0x000100 }, { 0x9610EB35, 0x000101 }, { 0x016736A9, 0x000102 }, { 0xCE273913, 0x000103 },
             { 0x4A3402A2, 0x000105 }, { 0x60AFBB62, 0x000106 }, { 0x8B345498, 0x000107 }, { 0x6EE83BCE, 0x000108 },
             { 0xA54FC955, 0x000109 }, { 0x6714AB36, 0x00010D }, { 0xF2B1BAC5, 0x000111 }, { 0x64DA5713, 0x010000 },   // 1.0.0 (same bitstream as 0.1.18)
-            { 0x4A6E0D82, 0x010001 },   // 1.0.1 (1.1.3: write-data setup applied to 4-clock cycles too, docs 55; slow=1 ends writes on tick16, docs 56)
+            { 0xD67286B2, 0x010001 },   // 1.0.1 (1.1.3: write-data setup applied to 4-clock cycles too (docs 55); writes always end on tick16 like a 68000 (docs 56.6))
         };
         for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) if (known[i].sum == sum && len == 135100) { flags = known[i].ver; from = "release table"; }
     }
