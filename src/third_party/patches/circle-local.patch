@@ -1,5 +1,5 @@
 diff --git a/include/circle/net/http.h b/include/circle/net/http.h
-index 28a3779..6b47d8c 100644
+index 28a3779..622b6bd 100644
 --- a/include/circle/net/http.h
 +++ b/include/circle/net/http.h
 @@ -28,7 +28,7 @@
@@ -11,6 +11,75 @@ index 28a3779..6b47d8c 100644
  #define HTTP_MAX_MULTIPART_BOUNDARY 100
  
  enum THTTPRequestMethod
+@@ -41,6 +41,7 @@ enum THTTPRequestMethod
+ 
+ enum THTTPStatus
+ {
++	HTTPResponseSent	  = 1,		// vmpu68: GetContent() sent the whole response itself (streamed file)
+ 	HTTPOK			  = 200,
+ 	HTTPBadRequest		  = 400,
+ 	HTTPNotFound		  = 404,
+diff --git a/include/circle/net/httpdaemon.h b/include/circle/net/httpdaemon.h
+index f41b62e..0c72128 100644
+--- a/include/circle/net/httpdaemon.h
++++ b/include/circle/net/httpdaemon.h
+@@ -59,6 +59,8 @@ public:
+ 				     unsigned		 nContentLength);
+ 
+ protected:
++	CSocket *GetSocket (void) const { return m_pSocket; }	// vmpu68: for handlers that stream the response themselves
++	void CloseAfterResponse (void);				// vmpu68: wait for the client to close first, then delete the socket
+ 	// returns the next part from multipart form data (TRUE if available)
+ 	// data is not available after returning from GetContent() any more
+ 	boolean GetMultipartFormPart (const char **ppHeader,	// returns part header
+diff --git a/lib/net/httpdaemon.cpp b/lib/net/httpdaemon.cpp
+index e9a5a45..5fc945f 100644
+--- a/lib/net/httpdaemon.cpp
++++ b/lib/net/httpdaemon.cpp
+@@ -204,6 +204,13 @@ void CHTTPDaemon::Worker (void)
+ 		m_pMultipartBuffer = 0;
+ 	}
+ 
++	if (Status == HTTPResponseSent)		// vmpu68: the handler sent everything, just close
++	{
++		CloseAfterResponse ();
++
++		return;
++	}
++
+ 	if (Status != HTTPOK)
+ 	{
+ 		switch (Status)
+@@ -284,6 +291,29 @@ void CHTTPDaemon::Worker (void)
+ 		}
+ 	}
+ 
++	CloseAfterResponse ();		// vmpu68: closes connection (passive close when the client closes first)
++}
++
++// vmpu68: wait briefly for the client to close first.  With "Connection: close"
++// the client closes as soon as the body is complete; deleting the socket before
++// its FIN arrives makes this side the active closer and the connection lingers
++// in TIME-WAIT (60 s).  Clients opening ~20 connections/s then hit
++// TCP_MAX_CONNECTIONS (1000) within a minute and new SYNs are refused (RST).
++// Taking the client's FIN first (CLOSE-WAIT -> LAST-ACK -> CLOSED) frees the
++// connection at once.  A client that does not close within the timeout is
++// closed actively as before.
++void CHTTPDaemon::CloseAfterResponse (void)
++{
++	assert (m_pSocket != 0);
++
++	m_pSocket->SetOptionReceiveTimeout (300000);		// 300 ms
++
++	u8 Buffer[64];
++	while (m_pSocket->Receive (Buffer, sizeof Buffer, 0) > 0)	// discard until closed / timeout
++	{
++		// nothing
++	}
++
+ 	delete m_pSocket;		// closes connection
+ 	m_pSocket = 0;
+ }
 diff --git a/lib/usb/gadget/usbcdcgadgetendpoint.cpp b/lib/usb/gadget/usbcdcgadgetendpoint.cpp
 index 813198b..2175a51 100644
 --- a/lib/usb/gadget/usbcdcgadgetendpoint.cpp

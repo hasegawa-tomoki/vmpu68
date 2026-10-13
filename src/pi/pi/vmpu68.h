@@ -118,6 +118,7 @@ int  vmpu68_probe_board(void);    /* try the 2.x then the 1.x layout for the FPG
                                        Older bitstreams have the raw WR# level here: see hw_rst_seen() */
 #define VDIAG_WR_AI     (1u << 2)   /* VREG_CTRL read: the bitstream implements VCTRL_AI (older: RD# sync level) */
 #define VDIAG_SNOOP2    (1u << 3)   /* VREG_CTRL read: echo of VSTW_SNOOP2 (older: WR# level, reads 1) */
+#define VDIAG_PSRAM     (1u << 4)   /* VREG_CTRL read: the core 2.1 PSRAM answered its self test (older bitstreams: 'armed', 1) */
 #define VDIAG_PLL_LOCK  (1u << 7)   /* VREG_CTRL read: bus clock PLL locked (X68000 on) */
 #define VDIAG_HB_FAST   (1u << 6)   /* VREG_CTRL read: toggles every 2^21 PLL clocks while it runs */
 #define VDIAG_HB_CLK16  (1u << 5)   /* VREG_CTRL read: toggles every 2^19 bus clocks (33 ms @16 MHz) */
@@ -231,6 +232,17 @@ void     vmpu68_smi_bench(uint32_t out[5]);  /* ns per op: DCS read, DA write, r
 #ifdef VMPU68_BAREMETAL
 void     vmpu68_set_smi_base(volatile uint32_t *smi_base, volatile uint32_t *cm_base);
 #endif
+
+/* PSRAM window (core 2.1, bitstream >= 1.1): bus addresses in 64 KB blocks
+ * [base, top) are served from the PSRAM - the Pi's own accesses internally,
+ * other masters' (DMAC, a real CPU) as a bus slave when slave=1.  passive=1
+ * is the riser 2.0 mode: the FPGA never drives or grants the bus.  Two CTRL
+ * writes with FC = 0 (never a bus cycle); the CTRL image is invalidated. */
+void     vmpu68_psram_cfg(unsigned base_blk, unsigned top_blk, int en, int slave, int passive);
+int      vmpu68_psram_present(void);    /* VDIAG_PSRAM (meaningless on bitstreams before 1.1, where the bit is 'armed') */
+unsigned vmpu68_slave_dbg(unsigned base_blk, unsigned page, int clr);
+void     vmpu68_set_hang_fn(void (*fn)(uint16_t st, uint16_t ctrl, unsigned d1, unsigned d2, unsigned d3));   /* called once when a busy wait gives up (2^24 polls) */   /* rw=1 config word bits 11:10 = page (1-3), bit 12 = clear; returns the CTRL low byte (page 0 restores it) */
+void     vmpu68_dtack_test(unsigned base_blk, int on);   /* rw=1 config word bit 9: hold the DTACK driver on while idle; CTRL bit 4 then shows the DTACK input (bitstream >= 1.1) */
 
 void vmpu68_flash_begin(void);
 void vmpu68_flash_end(void);            /* releases CRESET_B -> FPGA boots */

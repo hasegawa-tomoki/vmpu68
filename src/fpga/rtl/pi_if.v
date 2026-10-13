@@ -25,7 +25,7 @@
 //                    start of the command until the engine is idle again (busy_irq
 //                    mode), so completion costs one GPIO read instead of a STATUS
 //                    read.  Posted writes leave wt=0 and never touch the line.
-//              R: {8'h56, pll_lock, hb_fast, hb_clk16, armed, snoop2, ai_ok, rst_seen, hello}
+//              R: {8'h56, pll_lock, hb_fast, hb_clk16, ps_present, snoop2, ai_ok, rst_seen, hello}
 //                 (0x56 = 'V' signature; low byte = diagnostics.  hello = REG3
 //                 bit10 as last written: 0 after (re)configuration, so a host that set it
 //                 at init can tell the FPGA has been reloaded behind its back - the board
@@ -97,7 +97,25 @@ module pi_if (
     output reg         drv_reset,
     output reg         drv_halt,
     output reg         bus_slow,      // REG3 bit12: 5-tick bus cycles (see bus_engine)
-    output reg  [1:0]  wr_setup       // REG3 bit15:14: extra ticks of write-data setup before AS, 0-3 (see bus_engine)
+    output reg  [1:0]  wr_setup,      // REG3 bit15:14: extra ticks of write-data setup before AS, 0-3 (see bus_engine)
+
+    // PSRAM window / passive mode: a CTRL write with fc = 0 (never a bus
+    // cycle: FC 0 is undefined on a 68000) is a configuration word.
+    //   rw = 0: {[11] passive, [10] slave, [9] enable, [7:0] top block (64 KB, exclusive)}
+    //   rw = 1: {[9] dtack test, [7:0] base block}
+    //   (dtack test: the DTACK driver is held on while the engine is idle and
+    //   CTRL read bit 4 shows the DTACK input instead of ps_present, so the
+    //   host can check that the driver reaches the bus - core 2.1 Q4 rework)
+    output reg         ps_en,
+    output reg  [7:0]  ps_base,
+    output reg  [7:0]  ps_top,
+    output reg         ps_slave,
+    output reg         passive,
+    output reg         dtack_test,    // rw = 1 word bit 9: drive DTACK low while the engine is idle (driver self test)
+    output reg  [1:0]  dbg_sel,       // rw = 1 word bits 11:10: slave-path debug page shown in the CTRL low byte (0 = normal)
+    output reg         dbg_clr,       // rw = 1 word bit 12: one-clock pulse, clears the slave-path debug counters
+    input  wire [7:0]  dbg_byte,
+    input  wire        ps_present     // CTRL read bit 4 (was "armed"): the PSRAM answered its self test
 );
 
     // ---- strobe synchronizers ----
@@ -162,6 +180,7 @@ module pi_if (
     // lines in Dracula's title (docs 30/32) were exactly this, not the
     // CRTC.  While a waited command is pending the DATA output is the live
     // rdata, and the strobe's end pops nothing.
+    reg rd_avail;       // snoop_avail as sampled at the start of the current read strobe
     reg [15:0] ad_in;
     reg [1:0]  ra_wr, ra_rd;
     reg [15:0] rd_mux;  // live read mux (below)
@@ -200,7 +219,6 @@ module pi_if (
     reg [3:0] rst_cnt;
     reg cyc_wait;       // CTRL bit11 (wt): the Pi waits for this command
     reg snoop2;         // REG3 bit13: snoop stream v2 (valid-gated HI, continuation records)
-    reg rd_avail;       // snoop_avail as sampled at the start of the current read strobe
     reg cyc_ai;         // CTRL bit15 (ai): REG0 write starts a write cycle, address auto-advances
     wire ai_wr = cyc_ai && !cyc_rw;
     reg busy_d;
@@ -211,9 +229,12 @@ module pi_if (
         cyc_wait = 0; busy_irq = 0; wait_pend = 0; busy_d = 0; hello = 0; cyc_ai = 0; bus_slow = 0;
         rst_seen = 0; rst_clr = 0; rst_cnt = 0; snoop2 = 0; rd_avail = 0; rd_hold = 0; rd_pf = 0; wr_setup = 0; hold_live = 0;
         snoop_phase = 0; irq_en = 0; led = 0; drv_reset = 0; drv_halt = 0; autostart = 0;
+        ps_en = 0; ps_base = 0; ps_top = 0; ps_slave = 0; passive = 0; dtack_test = 0; dbg_sel = 0; dbg_clr = 0;
         wr_s = 3'b111; rd_s = 3'b111;
         armed = 0; arm_cnt = 0; hb16 = 0; hbf = 0;
     end   // 0=HI 1=LO 2=DATA
+    reg dbg_clr_d = 1'b0;
+    always @(posedge clk) begin dbg_clr_d <= dbg_clr; if (dbg_clr && dbg_clr_d) dbg_clr <= 1'b0; end   // 1-2 clocks wide
 
     // record layout: {cont, rw_last, uds, lds, addr[23:1], fc[2:0], n[1:0], data[15:0]}
     // snoop2: bit13 carries cont instead of rw, and the word is 0 while no
@@ -252,14 +273,24 @@ module pi_if (
                     if (autostart && !ai_wr) cyc_start <= 1'b1;   // fields from the last REG2
                 end
                 2'd2: begin
-                    cyc_addr[23:16] <= ad_in[7:0];
-                    cyc_rw          <= ad_in[8];
-                    cyc_word        <= ad_in[9];
-                    cyc_pf          <= ad_in[10];
-                    cyc_wait        <= ad_in[11];
-                    cyc_fc          <= ad_in[14:12];
-                    cyc_ai          <= ad_in[15];
-                    if (!autostart) cyc_start <= 1'b1;
+                    if (ad_in[14:12] == 3'b000) begin       // configuration word (fc = 0)
+                        if (ad_in[8]) begin ps_base <= ad_in[7:0]; dtack_test <= ad_in[9]; dbg_sel <= ad_in[11:10]; dbg_clr <= ad_in[12]; end
+                        else begin
+                            ps_top   <= ad_in[7:0];
+                            ps_en    <= ad_in[9];
+                            ps_slave <= ad_in[10];
+                            passive  <= ad_in[11];
+                        end
+                    end else begin
+                        cyc_addr[23:16] <= ad_in[7:0];
+                        cyc_rw          <= ad_in[8];
+                        cyc_word        <= ad_in[9];
+                        cyc_pf          <= ad_in[10];
+                        cyc_wait        <= ad_in[11];
+                        cyc_fc          <= ad_in[14:12];
+                        cyc_ai          <= ad_in[15];
+                        if (!autostart) cyc_start <= 1'b1;
+                    end
                 end
                 2'd3: begin
                     drv_reset <= ad_in[0];
@@ -336,8 +367,8 @@ module pi_if (
             2'd1: rd_mux = (snoop_phase == 2'd0) ? snoop_hi :
                            (snoop_phase == 2'd1) ? snoop_lo : snoop_data;
             // low byte = diagnostics (host code only checks 0x56, bit0, bit1)
-            2'd2: rd_mux = {8'h56, pll_lock, hbf[21], hb16[19], armed,
-                            snoop2, 1'b1 /* ai_ok */, rst_seen, hello};
+            2'd2: rd_mux = {8'h56, (dbg_sel != 2'd0) ? dbg_byte :
+                            {pll_lock, hbf[21], hb16[19], ps_present, snoop2, 1'b1 /* ai_ok */, rst_seen, hello}};
             // pf_count saturated to 3: {cnt>=2, cnt==1 || cnt>=3}
             2'd3: rd_mux = {busy_irq, pf_active, pf_count[3] | pf_count[2] | pf_count[1],
                             pf_count[3] | pf_count[2] | pf_count[0],

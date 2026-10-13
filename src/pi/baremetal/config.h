@@ -22,8 +22,10 @@ unsigned cfg_jit (void);                // jit=<0|1> 68000->AArch64 translation 
 unsigned cfg_sramboot (void);           // sramboot=<0|1> X68030-style boot screen from the SRAM boot program (0, default)
 void cfg_set_sramboot (unsigned on);
 const char *cfg_hw (void);              // hw=<rev> board revision string ("" = derive from the board profile)
+unsigned cfg_psram (void);              // psram=<0|1>: use the core 2.1 PSRAM as main RAM above the onboard RAM (default 1)
 unsigned cfg_smi (void);                // smi=<0|1> register transport on core 2.x (default 1); 1.x ignores it
 void cfg_set_smi (unsigned on);
+void cfg_set_psram (unsigned on);        // psram=<0|1>; persisted by cfg_save(); applies at the next machine boot
 int  cfg_smi_t (unsigned out[8]);        // smi_t=div,ws,wst,wh,rs,rst,rh,pace (0 = not set; a 0 field keeps the preset)         // persisted by cfg_save()
 unsigned cfg_board (void);              // board=<1|2> GPIO layout; 0 = auto (probe the FPGA with both layouts)
 void cfg_set_board (unsigned id);       // 0 = auto; persisted by cfg_save()
@@ -31,6 +33,9 @@ void cfg_set (unsigned mhz, unsigned wb, unsigned jit);   // change the runtime 
 void cfg_set_name (const char *v);      // display name (31 bytes max; persisted by cfg_save())
 void cfg_set_ram (unsigned mb);         // ram=<MB> fixed main RAM size, 0 = probe; takes effect at the next boot
 int  cfg_save (void);                   // rewrite SD:/vmpu68.cfg with the known keys; 0 = ok
+// vscsi<id>=<path>[,ro]: virtual SCSI image mounted at boot on ID 0-6 (SD root relative, e.g. /vscsi/a.hds)
+const char *cfg_vscsi (unsigned id, int *ro);   // "" when not configured
+void cfg_set_vscsi (unsigned id, const char *path, int ro);   // path "" = remove; persisted by cfg_save()
 
 // SD:/vmpu68-bus.json — bus timing per bus-clock class.  {"bus":[{...},...]}
 // with min_mhz (the class applies from this clock upward, 0.1 MHz steps),
@@ -47,6 +52,7 @@ struct cfg_bus_class
     unsigned wait_ns;
     unsigned io_mhz;
     int      ai;
+    int      slow;                      // 5-clock bus cycles (reads: data latched later); -1 = auto (on below 13 MHz, docs 55)
 };
 void cfg_bus_load (void);               // (re)read the file; defaults when absent/invalid
 unsigned cfg_bus_count (void);

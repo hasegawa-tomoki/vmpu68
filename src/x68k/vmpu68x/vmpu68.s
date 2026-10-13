@@ -40,6 +40,22 @@ LEAINFO         macro
 IOCS_B_PRINT    equ     $21
 IOCS_ROMVER     equ     $8F
 IOCS_CRTMOD     equ     $10
+; 仮想 SCSI のコマンドポート(emu68k.c の VSCSI コメントが正)。SRAM 版のフックと VMPU68.X -d が使う
+VSP             equ     $ECD100
+VS_CDB          equ     $00
+VS_ID           equ     $0C
+VS_DIR          equ     $0D
+VS_PEND         equ     $0E             ; 接続状態(0 なし、1 選択済み、2 CDB 受領、3 実行済み)
+VS_ADDR         equ     $10
+VS_LEN          equ     $14
+VS_CTL          equ     $18
+VS_RES          equ     $1A
+VS_MAGIC        equ     $20
+VS_HOOK         equ     $2C
+VS_OLDV         equ     $30
+VS_MASK         equ     $34
+VS_NOTE         equ     $36
+VS_CHUNK        equ     $40000          ; 1 回に渡せる最大バイト数(ポートの +$26 KB と同じ 256 KB)
 LOOPS_OUTER     equ     100             ; 計測ループ: 100 x 65536 回の dbra(1 回 10 サイクル)
 CYC_X10         equ     655360000       ; 65536000 サイクル x 10 (MHz x10 = CYC_X10 / us)
 
@@ -695,9 +711,415 @@ sstart:
                 sub.l   d6,d0
                 cmp.l   #SRAM_HOLD_US,d0
                 bcs     .shold
-.sdone:         movem.l (sp)+,d0-d7/a0-a6
+.sdone:         bsr     vs_install      ; 仮想 SCSI: IOCS _SCSIDRV のフックを入れる(ポートが無ければ何もしない)
+                movem.l (sp)+,d0-d7/a0-a6
                 rts
 msg_home:       dc.b    27,'[1;1H',0    ; 左上へ
+                even
+
+; ---------------------------------------------------------------- 仮想 SCSI の IOCS _SCSIDRV フック(SRAM 常駐)
+; Pi 側のコマンドポート($ECD100、emu68k.c の VSCSI コメントが正)に CDB・ID・方向・バッファ・長さを書いて開始し、
+; 完了をポーリングする。Pi が持つ ID(+$34 のマスク)だけを横取りし、それ以外は元の _SCSIDRV(+$30)へ渡す。
+; 元のベクタは Pi が預かり、後からディスク常駐ドライバが自前の IOCS をベクタに入れても Pi が先頭に戻す(見張り)。
+; 組み方は内蔵 SCSI ROM($FC0440〜)と同じ: d1 = 副機能、d2 = LBA/ページ、d3 = 件数/長さ、d4 = ID(bit0-2)と
+; LUN(上位ワード)、d5 = ブロック長コード(0:256 1:512 2:1024)、a1 = バッファ。戻り d0 = 0 正常、
+; ステータス(2 = CHECK CONDITION)、-1 = 装置なし。
+
+; 戻り d0 = 1 ポートあり(フック済み)、0 なし
+vs_install:     movem.l d1/a0/a6,-(sp)
+                move.l  $8.w,d1         ; バスエラー(ポートが無い = 旧カーネル)に備える
+                lea     vs_berr(pc),a0
+                move.l  a0,$8.w
+                lea     VSP,a6
+                move.l  VS_MAGIC(a6),d0
+                move.l  d1,$8.w
+                cmp.l   #'VSCS',d0
+                bne     vs_nf
+                lea     vs_hook(pc),a0
+                move.l  $7D4.w,d0
+                cmp.l   a0,d0                   ; もうフックが入っている(IPL が起動をやり直して SRAM プログラムを再実行)
+                bne     .fresh
+                tst.l   VS_HOOK(a6)             ; Pi がまだ預かっていればそのまま(旧ベクタをフック自身で上書きしない)
+                bne     .hooked
+                move.l  #$FC0440,d0             ; Pi 側だけ消えた: 内蔵 ROM の _SCSIDRV を旧ベクタとみなす
+.fresh:         move.l  d0,VS_OLDV(a6)          ; 今の _SCSIDRV を Pi に預ける(IOCS $F5 のベクタ)
+                move.l  a0,VS_HOOK(a6)
+                move.l  a0,$7D4.w               ; フックを入れる
+.hooked:        moveq   #1,d0
+                movem.l (sp)+,d1/a0/a6
+                rts
+vs_nf:          moveq   #0,d0
+                movem.l (sp)+,d1/a0/a6
+                rts
+vs_berr:        addq.l  #8,sp                   ; 68000 のバスエラーフレーム拡張部を捨てて vs_nf へ
+                lea     vs_nf(pc),a0
+                move.l  a0,2(sp)
+                move.l  d1,$8.w
+                rte
+
+; 元の _SCSIDRV へ(全レジスタそのまま)。呼び出して戻ってきたら結果 d0 も痕跡に残す(+$44)
+vs_chain:       move.l  a6,-(sp)
+                lea     VSP,a6
+                move.w  d4,$3A(a6)      ; 痕跡: 渡した呼び出しの d4(ID)と d1(副機能)を Pi に残す
+                move.w  d1,$38(a6)
+                pea     .back(pc)       ; 元の処理の rts で .back へ
+                move.l  VS_OLDV(a6),-(sp)
+                movea.l 8(sp),a6
+                rts                     ; → 元の _SCSIDRV
+.back:          move.l  a6,-(sp)
+                lea     VSP,a6
+                move.w  d0,$44(a6)      ; 結果(下位ワード)
+                movea.l (sp)+,a6
+                movea.l (sp)+,a6
+                tst.l   d0
+                rts
+
+vs_hook:        cmp.w   #$20,d1
+                bcc     vs_high
+                cmp.w   #$0D,d1
+                bcc     vs_chain        ; $0D 以上の低位は知らない → 元へ
+                move.l  a0,-(sp)        ; [a0]
+                move.w  d1,-(sp)        ; [d1][a0]
+                add.w   d1,d1
+                lea     vs_lowtab(pc),a0
+                adda.w  (a0,d1.w),a0    ; a0 = ハンドラ
+                move.w  (sp)+,d1        ; [a0]
+                move.l  a0,-(sp)        ; [h][a0]
+                movea.l 4(sp),a0        ; a0 を戻す
+                rts                     ; h へ(スタック先頭に保存した a0 が残る)
+vs_lowtab:      dc.w    vs_reset-vs_lowtab      ; 0 S_RESET
+                dc.w    vs_select-vs_lowtab     ; 1 S_SELECT
+                dc.w    vs_select-vs_lowtab     ; 2 S_SELECTA
+                dc.w    vs_cmdout-vs_lowtab     ; 3 S_CMDOUT
+                dc.w    vs_datain-vs_lowtab     ; 4 S_DATAIN
+                dc.w    vs_dataout-vs_lowtab    ; 5 S_DATAOUT
+                dc.w    vs_stsin-vs_lowtab      ; 6 S_STSIN
+                dc.w    vs_msgin-vs_lowtab      ; 7 S_MSGIN
+                dc.w    vs_msgout-vs_lowtab     ; 8 S_MSGOUT
+                dc.w    vs_pass-vs_lowtab       ; 9 S_PHASE
+                dc.w    vs_pass-vs_lowtab       ; A S_LEVEL
+                dc.w    vs_datain-vs_lowtab     ; B S_DATAINI
+                dc.w    vs_dataout-vs_lowtab    ; C S_DATAOUTI
+vs_pass:        movea.l (sp)+,a0
+                bra     vs_chain
+vs_reset:       movea.l (sp)+,a0
+                move.l  a6,-(sp)
+                lea     VSP,a6
+                move.w  #1,VS_NOTE(a6)  ; Pi に知らせる
+                clr.b   VS_PEND(a6)
+                movea.l (sp)+,a6
+                bra     vs_chain
+; 自分の ID か: d4 の bit0-2 を Pi のマスク(+$34)で見る。Z=1 なら自分ではない
+vs_mine:        movem.l d0-d1/a6,-(sp)
+                lea     VSP,a6
+                move.w  VS_MASK(a6),d0
+                move.l  d4,d1
+                and.w   #7,d1
+                btst    d1,d0
+                movem.l (sp)+,d0-d1/a6
+                rts
+; 接続中(選択済みの相手が自分)か: Z=1 なら違う
+vs_conn:        move.l  a6,-(sp)
+                lea     VSP,a6
+                tst.b   VS_PEND(a6)
+                movea.l (sp)+,a6
+                rts
+vs_select:      movea.l (sp)+,a0
+                bsr     vs_mine
+                beq     .no
+                move.l  a6,-(sp)
+                lea     VSP,a6
+                move.b  d4,VS_ID(a6)
+                move.b  #1,VS_PEND(a6)
+                movea.l (sp)+,a6
+                moveq   #0,d0
+                rts
+.no:            move.l  a6,-(sp)
+                lea     VSP,a6
+                clr.b   VS_PEND(a6)     ; 実バスの装置が相手: 以後の低位呼び出しは元へ渡す
+                movea.l (sp)+,a6
+                bra     vs_chain
+vs_cmdout:      movea.l (sp)+,a0
+                bsr     vs_conn
+                beq     vs_chain
+                movem.l d0-d1/a0-a1/a6,-(sp)
+                lea     VSP,a6
+                lea     VS_CDB(a6),a0
+                move.b  (a1),d0
+                and.b   #$E0,d0         ; コマンドグループ → 長さ 6/10/12
+                moveq   #6-1,d1
+                tst.b   d0
+                beq     .copy
+                moveq   #10-1,d1
+                cmp.b   #$20,d0
+                beq     .copy
+                cmp.b   #$40,d0
+                beq     .copy
+                moveq   #12-1,d1
+.copy:          move.b  (a1)+,(a0)+
+                dbra    d1,.copy
+                move.b  #2,VS_PEND(a6)
+                movem.l (sp)+,d0-d1/a0-a1/a6
+                moveq   #0,d0
+                rts
+vs_datain:      movea.l (sp)+,a0
+                bsr     vs_conn
+                beq     vs_chain
+                movem.l d1-d7/a0-a6,-(sp)
+                moveq   #1,d1           ; データイン
+                bra     vs_lowxfer
+vs_dataout:     movea.l (sp)+,a0
+                bsr     vs_conn
+                beq     vs_chain
+                movem.l d1-d7/a0-a6,-(sp)
+                moveq   #2,d1           ; データアウト
+vs_lowxfer:     lea     VSP,a6          ; d1 = 方向、d3 = 長さ、a1 = バッファ
+                move.b  d1,VS_DIR(a6)
+                move.l  a1,VS_ADDR(a6)
+                move.l  d3,VS_LEN(a6)
+                bsr     vs_go
+                move.b  #3,VS_PEND(a6)
+                movem.l (sp)+,d1-d7/a0-a6
+                tst.l   d0
+                bmi     .err            ; -1/-2 はそのまま
+                moveq   #0,d0           ; データ相は 0(ステータスは STSIN で返す)
+.err:           rts
+vs_stsin:       movea.l (sp)+,a0
+                bsr     vs_conn
+                beq     vs_chain
+                movem.l d1-d7/a0-a6,-(sp)
+                lea     VSP,a6
+                cmp.b   #2,VS_PEND(a6)  ; データ相が無かった → ここで実行
+                bne     .have
+                clr.b   VS_DIR(a6)
+                clr.l   VS_LEN(a6)
+                bsr     vs_go
+                move.b  #3,VS_PEND(a6)
+.have:          move.w  VS_CTL(a6),d0
+                lsr.w   #8,d0
+                move.b  d0,(a1)         ; ステータスバイト
+                movem.l (sp)+,d1-d7/a0-a6
+                moveq   #0,d0
+                rts
+vs_msgin:       movea.l (sp)+,a0
+                bsr     vs_conn
+                beq     vs_chain
+                clr.b   (a1)            ; COMMAND COMPLETE
+                move.l  a6,-(sp)
+                lea     VSP,a6
+                clr.b   VS_PEND(a6)
+                movea.l (sp)+,a6
+                moveq   #0,d0
+                rts
+vs_msgout:      movea.l (sp)+,a0
+                bsr     vs_conn
+                beq     vs_chain
+                moveq   #0,d0
+                rts
+
+; vs_go: ポートのコマンドを開始して完了を待つ。a6 = VSP。戻り d0 = 0 / ステータス / -1 / -2(d1 は保存)
+vs_go:          move.l  d1,-(sp)
+                move.w  #1,VS_CTL(a6)
+                move.l  #$1000000,d1    ; 時間切れ(1〜2 秒相当)
+.w:             move.w  VS_CTL(a6),d0
+                btst    #1,d0
+                bne     .done
+                subq.l  #1,d1
+                bne     .w
+                moveq   #-1,d0
+                bra     .ret
+.done:          btst    #2,d0           ; エラー(装置なし -1 / 要求不正 -2)
+                beq     .st
+                move.w  VS_RES(a6),d0
+                ext.l   d0
+                bra     .ret
+.st:            lsr.w   #8,d0
+                and.l   #$FF,d0         ; ステータスバイト(0 = GOOD、2 = CHECK CONDITION)
+.ret:           move.l  (sp)+,d1
+                rts
+
+; 高位副機能($20〜$39): 表 [opcode, LBA の形, 件数の形, 方向, 長さの形] で CDB を組む
+;   LBA の形: 0 なし、1 d2 → [1..3](24 ビット)、2 d2 → [2..5](32 ビット)、3 d2 → [2](ページ)、4 d2 → [1]
+;   件数の形: 0 なし、1 d3 → [4]、2 d3 → [7..8]、3 d3&3 → [4]、4 d3&1 → [4]、5 d3 → [3..4]、6 d3 → [5]、7 8 → [4]
+;   長さの形: 0 なし、1 d3 バイト、2 d3 ブロック(d3<<8<<d5、256 KB ずつに分割)、3 8 バイト、4 4 バイト
+vs_high:        cmp.w   #$3A,d1
+                bcc     vs_chain        ; 知らない副機能(レベル 4 の IOCS の拡張など)は元へ渡す
+                bsr     vs_mine
+                beq     vs_chain
+                movem.l d1-d7/a0-a6,-(sp)
+                lea     VSP,a6
+                sub.w   #$20,d1
+                mulu    #5,d1
+                lea     vs_tab(pc),a0
+                adda.w  d1,a0           ; a0 = 表の項目
+                move.b  (a0),d0
+                cmp.b   #$FF,d0
+                beq     .pass           ; 表に無い($33〜$35)は元へ
+                lea     VS_CDB(a6),a2
+                clr.l   (a2)
+                clr.l   4(a2)
+                clr.l   8(a2)
+                move.b  d0,(a2)         ; opcode
+                move.l  d4,d0
+                swap    d0
+                and.b   #7,d0
+                lsl.b   #5,d0
+                move.b  d0,1(a2)        ; LUN
+                move.b  d4,VS_ID(a6)
+                move.b  3(a0),VS_DIR(a6)
+                cmp.b   #2,4(a0)        ; ブロック転送 → 分割ループ
+                beq     .blocks
+                move.l  d3,d7
+                bsr     vs_putlc        ; LBA(d2)と件数(d7)
+                move.l  a1,VS_ADDR(a6)
+                moveq   #0,d0
+                move.b  4(a0),d1
+                beq     .len
+                subq.b  #1,d1
+                bne     .l3
+                move.l  d3,d0           ; d3 バイト
+                bra     .len
+.l3:            subq.b  #1,d1           ; (2 はここに来ない)
+                subq.b  #1,d1
+                bne     .l4
+                moveq   #8,d0
+                bra     .len
+.l4:            moveq   #4,d0
+.len:           move.l  d0,VS_LEN(a6)
+                bsr     vs_go
+                bra     .out
+.blocks:        moveq   #8,d6
+                add.b   d5,d6           ; d6 = ブロック長のシフト(256<<d5)
+                move.l  #VS_CHUNK,d1
+                lsr.l   d6,d1           ; d1 = 1 回のブロック数
+                cmp.b   #1,2(a0)        ; 件数が 1 バイトの形(READ/WRITE(6))は 256 まで
+                bne     .bpc
+                cmp.l   #256,d1
+                bls     .bpc
+                move.l  #256,d1
+.bpc:           tst.l   d3
+                beq     .zero
+.chunk:         move.l  d3,d7
+                cmp.l   d1,d7
+                bls     .n
+                move.l  d1,d7
+.n:             bsr     vs_putlc
+                move.l  a1,VS_ADDR(a6)
+                move.l  d7,d0
+                lsl.l   d6,d0
+                move.l  d0,VS_LEN(a6)
+                bsr     vs_go
+                tst.l   d0
+                bne     .out
+                move.l  d7,d0
+                lsl.l   d6,d0
+                adda.l  d0,a1
+                add.l   d7,d2
+                sub.l   d7,d3
+                bne     .chunk
+.zero:          moveq   #0,d0
+.out:           movem.l (sp)+,d1-d7/a0-a6
+                rts
+.pass:          movem.l (sp)+,d1-d7/a0-a6
+                bra     vs_chain
+; vs_putlc: a0 = 表の項目、a2 = CDB、d2 = LBA、d7 = 件数 を CDB に入れる(d0 を壊す。d6 は退避)
+vs_putlc:       move.l  d6,-(sp)
+                bsr     vs_putlc1
+                move.l  (sp)+,d6
+                rts
+vs_putlc1:      move.b  1(a0),d0
+                beq     .cnt
+                subq.b  #1,d0
+                bne     .l2
+                move.l  d2,d6           ; 24 ビット: [3] [2] [1](bit16-20 は [1] の下位、LUN と OR)
+                move.b  d6,3(a2)
+                lsr.l   #8,d6
+                move.b  d6,2(a2)
+                lsr.l   #8,d6
+                and.b   #$1F,d6
+                or.b    d6,1(a2)
+                bra     .cnt
+.l2:            subq.b  #1,d0
+                bne     .l3
+                move.l  d2,d6           ; 32 ビット: [2..5]
+                move.b  d6,5(a2)
+                lsr.l   #8,d6
+                move.b  d6,4(a2)
+                lsr.l   #8,d6
+                move.b  d6,3(a2)
+                lsr.l   #8,d6
+                move.b  d6,2(a2)
+                bra     .cnt
+.l3:            subq.b  #1,d0
+                bne     .l4
+                move.b  d2,2(a2)        ; ページコード
+                bra     .cnt
+.l4:            or.b    d2,1(a2)        ; MODE SELECT: [1] |= d2
+.cnt:           move.b  2(a0),d0
+                beq     .done
+                subq.b  #1,d0
+                bne     .c2
+                move.b  d7,4(a2)        ; [4] = 件数(256 は 0)
+                bra     .done
+.c2:            subq.b  #1,d0
+                bne     .c3
+                move.b  d7,8(a2)        ; [7..8]
+                move.l  d7,d6
+                lsr.l   #8,d6
+                move.b  d6,7(a2)
+                bra     .done
+.c3:            subq.b  #1,d0
+                bne     .c4
+                move.b  d7,d6
+                and.b   #3,d6
+                move.b  d6,4(a2)
+                bra     .done
+.c4:            subq.b  #1,d0
+                bne     .c5
+                move.b  d7,d6
+                and.b   #1,d6
+                move.b  d6,4(a2)
+                bra     .done
+.c5:            subq.b  #1,d0
+                bne     .c6
+                move.b  d7,4(a2)        ; [3..4] = 件数(上位、下位)
+                move.l  d7,d6
+                lsr.l   #8,d6
+                move.b  d6,3(a2)
+                bra     .done
+.c6:            subq.b  #1,d0
+                bne     .c7
+                move.b  d7,5(a2)        ; [5]
+                bra     .done
+.c7:            move.b  #8,4(a2)
+.done:          rts
+;               op  LBA cnt dir len
+vs_tab:         dc.b $12,  0,  1,  1,  1    ; $20 S_INQUIRY
+                dc.b $08,  1,  1,  1,  2    ; $21 S_READ
+                dc.b $0A,  1,  1,  2,  2    ; $22 S_WRITE
+                dc.b $04,  0,  5,  0,  0    ; $23 S_FORMAT
+                dc.b $00,  0,  0,  0,  0    ; $24 S_TESTUNIT
+                dc.b $25,  0,  0,  1,  3    ; $25 S_READCAP
+                dc.b $28,  2,  2,  1,  2    ; $26 S_READEXT
+                dc.b $2A,  2,  2,  2,  2    ; $27 S_WRITEEXT
+                dc.b $2F,  2,  2,  2,  2    ; $28 S_VERIFYEXT(ROM はデータアウト)
+                dc.b $1A,  3,  1,  1,  1    ; $29 S_MODESENSE
+                dc.b $15,  4,  1,  2,  1    ; $2A S_MODESELECT
+                dc.b $01,  0,  0,  0,  0    ; $2B S_REZEROUNIT
+                dc.b $03,  0,  1,  1,  1    ; $2C S_REQUEST
+                dc.b $0B,  1,  1,  0,  0    ; $2D S_SEEK
+                dc.b $08,  1,  1,  1,  2    ; $2E S_READI
+                dc.b $1B,  0,  3,  0,  0    ; $2F S_STARTSTOP
+                dc.b $C1,  0,  4,  0,  0    ; $30 S_SEJECT
+                dc.b $07,  0,  7,  2,  1    ; $31 S_REASSIGN
+                dc.b $1E,  0,  4,  0,  0    ; $32 S_PAMEDIUM
+                dc.b $FF,  0,  0,  0,  0    ; $33
+                dc.b $FF,  0,  0,  0,  0    ; $34
+                dc.b $FF,  0,  0,  0,  0    ; $35
+                dc.b $C2,  0,  6,  2,  1    ; $36 S_DSKINI
+                dc.b $06,  1,  1,  0,  0    ; $37 S_FORMATB
+                dc.b $07,  1,  1,  0,  0    ; $38 S_BADFMT
+                dc.b $0E,  1,  1,  2,  4    ; $39 S_ASSIGN
                 even
                 endc
 
@@ -774,6 +1196,8 @@ xstart:
                 beq     .opt_n
                 cmp.b   #'t',d0
                 beq     .opt_t
+                cmp.b   #'d',d0
+                beq     .opt_d
                 cmp.b   #'w',d0
                 bne     .parse
                 bsr     getnum
@@ -781,6 +1205,8 @@ xstart:
                 move.w  d2,SET_WB(a6)
                 moveq   #1,d6
                 bra     .parse
+.opt_d:         bsr     drvlist         ; -d: ドライブ一覧
+                bra     .exit
 .opt_s:         bsr     getnum
                 cmp.w   #1000,d2
                 bhi     .parse
@@ -890,6 +1316,209 @@ xstart:
                 addq.l  #4,sp
                 dc.w    $FF00           ; DOS _EXIT
 
+; VMPU68 -d: Human68k のドライブ一覧。DPB(DOS _GETDPB)からユニット番号とデバイスドライバの名前を取り、
+; フロッピー(DISK2HD)以外は DOS _DSKFRE で一度アクセスして、仮想 SCSI ポートのコマンド数(+$2A)が増えたら仮想ディスク
+; (ID = +$3C)、素通し回数(+$3E)が増えたら実バスの装置(ID = +$3A の下位 3 ビット)。装置の名前は Pi が LAN の vhd68/vfd68
+; に聞いて作る表(+$40 に 1 を書いて頼み、2 になったら +$42 に番号を書いて +$48 から 32 バイト読む。0〜7 = SCSI ID、
+; 8〜11 = FDD ユニット)。(ドライバのヘッダに SCSI ID は入っていない。イジェクト済みの仮想 ID は「ディスクが入っていません」)
+VS_COUNT_LO     equ     $2A
+VS_TRACE_ID     equ     $3A
+VS_LAST_ID      equ     $3C
+VS_TRACE_N      equ     $3E
+VS_LREQ         equ     $40
+VS_LIDX         equ     $42
+VS_LABEL        equ     $48
+VS_CHAIN_CNT    equ     $68             ; +$68〜 素通しの回数(ID 0〜7、ワード)、+$78〜 仮想コマンドの回数(ID 0〜7)
+drvlist:        movem.l d0-d7/a0-a6,-(sp)
+                moveq   #0,d5           ; 1 = ポートあり
+                move.l  $8.w,d6
+                lea     .berr(pc),a0
+                move.l  a0,$8.w
+                lea     VSP,a6
+                move.l  VS_MAGIC(a6),d0
+                cmp.l   #'VSCS',d0
+                bne     .noport
+                moveq   #1,d5
+                move.w  #1,VS_LREQ(a6)  ; 装置名の表を頼む(Pi が vhd68/vfd68 に問い合わせる、数百 ms)
+                move.l  #3000000,d0
+.lwait:         cmp.w   #2,VS_LREQ(a6)
+                beq     .noport
+                subq.l  #1,d0
+                bne     .lwait
+.noport:        move.l  d6,$8.w
+                lea     msg_dhead(pc),a1
+                moveq   #IOCS_B_PRINT,d0
+                trap    #15
+                moveq   #1,d4           ; 1 = A:
+.dl:            lea     dpbbuf(pc),a0
+                move.l  a0,-(sp)
+                move.w  d4,-(sp)
+                dc.w    $FF32           ; DOS _GETDPB(drive, buf)
+                addq.l  #6,sp
+                tst.l   d0
+                bmi     .dnext
+                lea     dpbbuf(pc),a0
+                lea     dline(pc),a2
+                move.w  d4,d0
+                add.b   #'A'-1,d0
+                move.b  d0,(a2)+
+                move.b  #':',(a2)+
+                move.b  #' ',(a2)+
+                move.b  #' ',(a2)+
+                movea.l 18(a0),a3       ; ドライバヘッダ
+                move.l  a3,d0
+                beq     .dnohdr
+                lea     $F(a3),a4       ; 名前(+$E はユニット数)、7 文字固定幅
+                moveq   #6,d3
+.dname:         move.b  (a4)+,d0
+                cmp.b   #' ',d0
+                bcc     .dname2
+                move.b  #' ',d0
+.dname2:        move.b  d0,(a2)+
+                dbra    d3,.dname
+                move.b  #' ',(a2)+
+                move.b  #' ',(a2)+
+                cmpi.l  #'ISK2',$10(a3) ; フロッピー(DISK2HD。名前は +$F からだが奇数番地なので +$10 で比べる)
+                bne     .dprobe
+                lea     msg_fdd(pc),a3
+                bsr     dcpy
+                move.b  1(a0),d0
+                and.w   #3,d0
+                add.b   #'0',d0
+                move.b  d0,(a2)+
+                lea     msg_fpad(pc),a3 ; "SCSI ID n" と幅を揃える
+                bsr     dcpy
+                moveq   #0,d0
+                move.b  1(a0),d0
+                and.w   #3,d0
+                addq.w  #8,d0           ; 表の 8〜11 = FDD ユニット
+                bsr     label
+                bra     .dnohdr
+.dprobe:        tst.w   d5
+                beq     .dnohdr         ; ポートが無ければ調べない
+                lea     VSP,a6
+                lea     cntbuf(pc),a4   ; ID ごとの回数(素通し 8 + 仮想 8)を控える
+                lea     VS_CHAIN_CNT(a6),a5
+                moveq   #15,d3
+.dsnap:         move.w  (a5)+,(a4)+
+                dbra    d3,.dsnap
+                ; ドライバに直接 1 セクタ読ませる(DOS のバッファに影響されない): 要求ヘッダ +1 ユニット、+2 コマンド 4(READ)、
+                ; +13 メディアバイト、+14 バッファ、+18 セクタ数、+22 開始セクタ。ヘッダ +6 の戦略ルーチン、+10 の割込みルーチン
+                lea     reqh(pc),a5
+                moveq   #25,d3
+.rclr:          clr.b   (a5,d3.w)
+                dbra    d3,.rclr
+                move.b  #26,(a5)
+                move.b  1(a0),1(a5)
+                move.b  #4,2(a5)
+                move.b  22(a0),13(a5)
+                lea     secbuf(pc),a1
+                move.l  a1,14(a5)
+                move.l  #1,18(a5)
+                clr.l   22(a5)
+                movea.l 18(a0),a3
+                movea.l 6(a3),a1
+                jsr     (a1)
+                movea.l 10(a3),a1
+                jsr     (a1)
+                ; 増えた ID を探す(仮想が優先)
+                lea     VSP,a6
+                lea     cntbuf(pc),a4
+                moveq   #-1,d6          ; 見つけた番号(0〜7 仮想、8〜15 素通し → ID = 下位 3 ビット)、-1 なし
+                moveq   #0,d3
+.dcmp:          move.w  d3,d0
+                add.w   d0,d0
+                lea     VS_CHAIN_CNT(a6),a5
+                move.w  (a5,d0.w),d1
+                cmp.w   (a4,d0.w),d1
+                beq     .dcmpn
+                cmp.w   #8,d3
+                bcs     .dcmpr
+                move.w  d3,d6           ; 仮想(8〜15): 優先
+                bra     .dcmpd
+.dcmpr:         tst.w   d6
+                bpl     .dcmpn
+                move.w  d3,d6           ; 素通し(0〜7)
+.dcmpn:         addq.w  #1,d3
+                cmp.w   #16,d3
+                bcs     .dcmp
+.dcmpd:         tst.w   d6
+                bmi     .dunknown
+                move.w  d6,d0
+                and.w   #7,d0
+                move.w  d0,-(sp)
+                lea     msg_scsi(pc),a3
+                bsr     dcpy
+                add.b   #'0',d0
+                move.b  d0,(a2)+
+                move.b  #' ',(a2)+
+                move.b  #' ',(a2)+
+                move.w  (sp)+,d0
+                bsr     label
+                bra     .dnohdr
+.dunknown:      lea     msg_unk(pc),a3
+                bsr     dcpy
+.dnohdr:        move.b  #13,(a2)+
+                move.b  #10,(a2)+
+                clr.b   (a2)
+                lea     dline(pc),a1
+                moveq   #IOCS_B_PRINT,d0
+                trap    #15
+.dnext:         addq.w  #1,d4
+                cmp.w   #26,d4
+                bls     .dl
+                movem.l (sp)+,d0-d7/a0-a6
+                rts
+.berr:          addq.l  #8,sp           ; ポート無し: バスエラーから .noport へ
+                lea     .noport(pc),a0
+                move.l  a0,2(sp)
+                move.l  d6,$8.w
+                rte
+; label: 表の d0 番の名前(Pi が作った、無ければ空)を a2 へ。ポートが無ければ何もしない
+label:          movem.l d0-d1/a3/a6,-(sp)
+                tst.w   d5
+                beq     .lend
+                lea     VSP,a6
+                move.w  d0,VS_LIDX(a6)
+                lea     VS_LABEL(a6),a3
+                moveq   #15,d1
+.lcp:           move.w  (a3)+,d0
+                swap    d0
+                rol.l   #8,d0           ; 上位バイト
+                tst.b   d0
+                beq     .lend
+                move.b  d0,(a2)+
+                rol.l   #8,d0           ; 下位バイト
+                tst.b   d0
+                beq     .lend
+                move.b  d0,(a2)+
+                dbra    d1,.lcp
+.lend:          movem.l (sp)+,d0-d1/a3/a6
+                rts
+dcpy:           move.b  (a3)+,(a2)+     ; a3 の文字列を a2 へ(NUL は書かない)
+                bne     dcpy
+                subq.l  #1,a2
+                rts
+hexb:           move.b  d0,-(sp)        ; d0.b を 16 進 2 桁で a2 へ
+                lsr.b   #4,d0
+                bsr     hexn
+                move.b  (sp)+,d0
+hexn:           and.w   #15,d0
+                move.b  hexdig(pc,d0.w),(a2)+
+                rts
+hexdig:         dc.b    '0123456789ABCDEF'
+msg_dhead:      dc.b    'drv driver   device',13,10,0
+msg_scsi:       dc.b    'SCSI ID ',0
+msg_fdd:        dc.b    'FDD ',0
+msg_fpad:       dc.b    '      ',0
+msg_unk:        dc.b    '(not SCSI, or no access)',0
+                even
+dpbbuf:         ds.b    64
+dline:          ds.b    96
+reqh:           ds.b    32
+cntbuf:         ds.w    16
+secbuf:         ds.b    2048
+
 ; getnum: a5 から 10 進数を読んで d2 へ(d1 = 残り長さを更新)
 getnum:         moveq   #0,d2
 .g:             tst.w   d1
@@ -908,9 +1537,10 @@ getnum:         moveq   #0,d2
 .gend:          rts
 
 msg_usage:      dc.b    13,10,13,10,'usage: VMPU68 [-b] [-s10|-s16|-s24|-s0] [-w1|-w0] [-j1|-j0] [-i1|-i0] [-m<MB>|-m0]',13,10
-                dc.b    '              [-n<name>] [-t1|-t0]',13,10
+                dc.b    '              [-n<name>] [-t1|-t0] [-d]',13,10
                 dc.b    '  -b: banner only   -s: speed   -w: write-back   -j: JIT   -i: boot screen',13,10
-                dc.b    '  -m: RAM size (0=auto, next boot)   -n: host name (up to the next " -")   -t: SMI (V2.0+)',13,10,13,10,0
+                dc.b    '  -m: RAM size (0=auto, next boot)   -n: host name (up to the next " -")   -t: SMI (V2.0+)',13,10
+                dc.b    '  -d: drive list (unit, driver, SCSI ID)',13,10,13,10,0
                 even
 namebuf:        ds.b    32              ; ワード転送するので偶数番地に
 infobase:       dc.l    INFO            ; 見つけた情報ポートの番地(build_text が旧番地に切り替えることがある)

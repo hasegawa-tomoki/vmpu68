@@ -35,6 +35,12 @@ void vmpu68_set_gpio_base(volatile unsigned int *base);
 void vmpu68_set_smi_base(volatile unsigned int *smi_base, volatile unsigned int *cm_base);
 void vmpu68_pace_bench(unsigned n);
 }
+#ifdef VMPU68_WITH_EMU
+#include "vscsi.h"
+#include "sdimg.h"
+#include "netfetch.h"
+#include "lanlabel.h"
+#endif
 
 #ifdef VMPU68_WITH_EMU
 static boolean s_gpclk_on = FALSE;   // gpclk <div> active (PLL test clock on BCM4/AD2)
@@ -44,6 +50,9 @@ static volatile boolean  s_emu_run;            // erun: free-running emulator (c
 static volatile boolean  s_auto = TRUE;        // supervise X68000 power/reset and run automatically
 static boolean           s_x68_on;             // PLL locked = X68000 clock present
 static boolean           s_fpga_frozen;        // FPGA answers but its clock is stopped (2.x with the X68000 off): waiting, not re-initialising
+static boolean           s_psram_on;           // core 2.1: the PSRAM window is mapped above the onboard RAM
+static char              s_psram_scan[64] = "not run";   // last PSRAM window scan: "passed" or why it failed (console 'psram')
+boolean vmpu68_psram_on (void) { return s_psram_on; }
 
 // X68000 supervision state (main loop; here so that "auto" can show it)
 static struct {
@@ -63,6 +72,7 @@ static volatile unsigned s_emu_mhz;            // espd: emulated clock limit in 
 static unsigned s_bus_mhz10;                   // measured bus clock in 0.1 MHz (167 = 16.7), see BootX68
 static const cfg_bus_class *s_bus_cls;         // the timing class in use (config.h)
 static int s_bus_setup_auto = -1;              // wr_setup found by the boot probe (-1 = not probed)
+static int s_bus_slow_pref = 0;                // console 'slow 1': 5-clock bus cycles, re-applied after every BootX68 (diagnostics)
 static const char *probed_str (void);          // " (probed: n)" for bcls
 
 // pace the emulator against the 1 MHz system timer so that ROM/software delay loops
@@ -158,6 +168,10 @@ void CEmuCore::Run (unsigned nCore)
 {
     if (nCore == 2)
         hw_wq_worker ();                       // posted-write queue: drives the GPIO strobes for core 1 (never returns)
+#ifdef VMPU68_WITH_EMU
+    if (nCore == 3)
+        vscsi_worker ();                       // virtual SCSI targets for the $ECD100 command port (never returns)
+#endif
     if (nCore != 1)
         for (;;) asm volatile ("wfe");
     for (;;)
@@ -252,6 +266,7 @@ void vmpu68_emu_reset (void)
     emu_ensure ();
     emu_quiesce ();
     emu68k_reset ();
+    vscsi_on_reset ();                         // ejected virtual IDs go back to the real bus
     s_emu_run = TRUE;
     DataSyncBarrier ();
 }
@@ -406,6 +421,107 @@ static void PanicPutc (uintptr base, char c)
     write32 (base + 0x00, (u32) (u8) c);
 }
 static void PanicPuts (uintptr base, const char *s) { for (; *s; s++) { if (*s == '\n') PanicPutc (base, '\r'); PanicPutc (base, *s); } }
+// Crash record: the panic handler leaves the log tail in a fixed RAM area that
+// survives the watchdog reset (the firmware reloads the kernel but does not
+// clear RAM); the next boot appends it to SD:/crash.log.  The area is near
+// the top of a 1 GB Pi 4's ARM memory, far above anything the heap hands out
+// early in a boot.
+#define CRASHREC_ADDR  0x3A000000u
+#define CRASHREC_MAGIC 0x58425842u
+struct crashrec_t { u32 magic; u32 len; char text[6144]; };
+static unsigned snprintf_lite (char *dst, unsigned size, const char *why, const char *cmd, unsigned uptime)
+{
+    CString s; s.Format ("[%s: last console cmd '%s', uptime %us]\n", why, cmd, uptime);
+    unsigned n = s.GetLength (); if (n >= size) n = size - 1;
+    memcpy (dst, (const char *) s, n); dst[n] = 0;
+    return n;
+}
+static void crashrec_store (const char *text, unsigned n)
+{
+    crashrec_t *b = (crashrec_t *) (uintptr) CRASHREC_ADDR;
+    if (n > sizeof b->text) { text += n - sizeof b->text; n = sizeof b->text; }
+    memcpy (b->text, text, n);
+    b->len = n;
+    b->magic = CRASHREC_MAGIC;
+    CleanDataCache ();
+}
+static char s_last_cmd[96] = "";          // the console command being executed (for the crash record)
+static unsigned s_hang_n = 0; static CString s_hang_last;   // bus waits that gave up (console 'bwait')
+static volatile unsigned s_con_t0 = 0, s_con_active = 0;     // console command in progress (stall sampler)
+static volatile unsigned s_stall_n = 0, s_stall_ms = 0, s_stall_phase = 0, s_stall_addr = 0, s_stall_uptime = 0; static char s_stall_cmd[96] = "";
+static volatile boolean s_stall_logged = FALSE;
+static void stall_sampler (TKernelTimerHandle, void *, void *)
+{
+    if (s_con_active)
+    {
+        unsigned el = CTimer::GetClockTicks () - s_con_t0;
+        if (el > 2000000)                      // a console command running for more than 2 s: record where it is
+        {
+            s_stall_n++; s_stall_ms = el / 1000; s_stall_phase = hw_phase; s_stall_addr = hw_phase_addr; s_stall_uptime = CTimer::Get ()->GetUptime ();
+            strncpy (s_stall_cmd, s_last_cmd, sizeof s_stall_cmd - 1);
+            if (!s_stall_logged)               // once per stuck command: lands in the crash record (SD copy) before a watchdog reset
+            {
+                s_stall_logged = TRUE;
+                CLogger::Get ()->Write ("vmpu68", LogWarning, "stall: console cmd '%s' running %u ms, hw_bus_read phase %u addr %06X, FPGA status %04X",
+                                        s_stall_cmd, s_stall_ms, s_stall_phase, s_stall_addr, hw_status ());
+            }
+        }
+    }
+    CTimer::Get ()->StartKernelTimer (HZ, stall_sampler);
+}
+static void crashrec_snapshot (const char *why)
+{
+    static char buf[LOGGER_BUFSIZE + 1];
+    static char rec[6144];
+    int n = CLogger::Get ()->Read (buf, LOGGER_BUFSIZE, FALSE);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    unsigned h = 0;
+    h += (unsigned) snprintf_lite (rec, sizeof rec, why, s_last_cmd, CTimer::Get ()->GetUptime ());
+    unsigned room = sizeof rec - 1 - h;
+    const char *tail = buf + ((unsigned) n > room ? (unsigned) n - room : 0);
+    unsigned m = strlen (tail); if (m > room) m = room;
+    memcpy (rec + h, tail, m); rec[h + m] = 0;
+    crashrec_store (rec, h + m);
+}
+// SD copy of the snapshot (1 Hz from the main loop): survives even when the
+// RAM record does not.  Fixed-size overwrite + sync, no truncation.
+static unsigned s_crashrec_sd_writes = 0, s_crashrec_sd_fail = 0;
+static void crashrec_sd (void)
+{
+    crashrec_t *b = (crashrec_t *) (uintptr) CRASHREC_ADDR;
+    if (b->magic != CRASHREC_MAGIC) return;
+    static boolean bKeptPrev = FALSE;          // the previous run's copy survives as SD:/crashprev.txt (a watchdog reset loses the RAM record)
+    if (!bKeptPrev) { bKeptPrev = TRUE; f_unlink ("SD:/crashprev.txt"); f_rename ("SD:/crashrec.txt", "SD:/crashprev.txt"); }
+    FIL f; UINT bw;
+    if (f_open (&f, "SD:/crashrec.txt", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) { s_crashrec_sd_fail++; return; }
+    static char pad[sizeof b->text + 64];
+    unsigned n = b->len; if (n > sizeof b->text) n = sizeof b->text;
+    memcpy (pad, b->text, n); memset (pad + n, ' ', sizeof pad - n); pad[sizeof pad - 1] = '\n';
+    f_lseek (&f, 0);
+    f_write (&f, pad, sizeof pad, &bw);
+    f_sync (&f);
+    f_close (&f);
+    s_crashrec_sd_writes++;
+}
+static void crashrec_recover (void)
+{
+    crashrec_t *b = (crashrec_t *) (uintptr) CRASHREC_ADDR;
+    if (b->magic != CRASHREC_MAGIC || b->len > sizeof b->text) return;
+    FIL f; UINT bw; unsigned saved = 0;
+    if (f_open (&f, "SD:/crash.log", FA_WRITE | FA_OPEN_APPEND) == FR_OK)
+    {
+        CString hdr;
+        hdr.Format ("==== crash record saved at boot of %s %s (%u bytes) ====\n", VMPU68_VERSION, VMPU68_BUILD, b->len);
+        f_write (&f, (const char *) hdr, hdr.GetLength (), &bw);
+        f_write (&f, b->text, b->len, &bw); saved = bw;
+        f_write (&f, "\n==== end ====\n", 15, &bw);
+        f_close (&f);
+    }
+    CLogger::Get ()->Write (FromKernel, LogWarning, "crash record: the previous run died - %u bytes of its log tail appended to SD:/crash.log", saved);
+    b->magic = 0;
+    CleanDataCache ();
+}
 static void PanicFlush (void)
 {
     static char buf[LOGGER_BUFSIZE + 1];
@@ -415,6 +531,7 @@ static void PanicFlush (void)
     if (n < 0) n = 0;
     buf[n] = 0;
     const char *tail = buf + (n > 1500 ? n - 1500 : 0);
+    crashrec_snapshot ("panic");                    // for SD:/crash.log at the next boot
     PanicPuts (base, "\n[panic] log tail:\n");
     PanicPuts (base, tail);
     // "PC 0x..." in the dump -> which JIT block (if any)
@@ -559,7 +676,7 @@ int vmpu68_sramboot_set (int on, boolean save)
 const char *vmpu68_hw_rev (void)
 {
     if (cfg_hw ()[0]) return cfg_hw ();
-    return vmpu68_board_id () == 1 ? "1.0" : "2.0.1";   // the built 2.x boards are 2.0.1; 2.1 (PSRAM) is not detectable yet: hw=2.1 in vmpu68.cfg
+    return vmpu68_board_id () == 1 ? "1.0" : vmpu68_psram_on () ? "2.1" : "2.0.1";   // 2.x: the PSRAM window tells 2.1 from 2.0.1 (hw= in vmpu68.cfg overrides)
 }
 
 // Runtime settings (Web UI /api/config, VMPU68.X through the information
@@ -611,8 +728,21 @@ boolean CKernel::Initialize (void)
 #endif
     if (bOK) bOK = m_EMMC.Initialize ();
     if (bOK) bOK = (f_mount (&m_FileSystem, "SD:", 1) == FR_OK);
+    if (bOK) sdimg_init (m_EMMC.GetSize ());   // image volume (2nd partition, "SD2:") if the card has one
     if (bOK) cfg_load ();               // SD:/vmpu68.cfg (name=, ram=, mhz=, board=)
     if (bOK) cfg_bus_load ();           // SD:/vmpu68-bus.json (bus timing per clock class)
+#ifdef VMPU68_WITH_EMU
+    if (bOK)                            // virtual SCSI: file I/O task on this core, then the images from vmpu68.cfg
+    {
+        vscsi_start_io_task ();
+        for (unsigned id = 0; id < 7; id++)
+        {
+            int ro = 0; const char *path = cfg_vscsi (id, &ro);
+            if (path[0] && vscsi_mount (id, path, ro != 0) != 0)
+                CLogger::Get ()->Write (FromKernel, LogWarning, "vscsi: ID %u: cannot mount %s", id, path);
+        }
+    }
+#endif
     if (bOK) fpga_version_fixup ();     // SD:/fpga.sum without a version: take it from SD:/update.vpk when the bitstream matches
 
     // board GPIO layout: vmpu68.cfg board= wins; otherwise ask the FPGA
@@ -631,6 +761,14 @@ boolean CKernel::Initialize (void)
     if (bOK) bOK = m_pSerial->Initialize (115200);
     if (bOK) bOK = m_Logger.Initialize (m_pSerial);
     m_Logger.RegisterPanicHandler (PanicFlush);
+    if (bOK) crashrec_recover ();              // a crash record left by the previous run (see PanicFlush)
+    CTimer::Get ()->StartKernelTimer (HZ, stall_sampler);   // 1 Hz: where a long console command is stuck
+    vmpu68_set_hang_fn ([] (uint16_t st, uint16_t ctrl, unsigned d1, unsigned d2, unsigned d3) {
+        s_hang_n++;
+        s_hang_last.Format ("#%u at %us (%s path): STATUS %04X (busy %u pf_active %u pf_cnt %u fault %u) CTRL %04X | engine st %u, PSRAM frame state %u | last slave write be %u%u A6-A1 %02X data %02X | cmd '%s'",
+                            s_hang_n, CTimer::Get ()->GetUptime (), (d1 & 0x100) ? "pf" : "plain", st, st & 1, (st >> 14) & 1, (st >> 12) & 3, (st >> 1) & 1, ctrl,
+                            d1 & 31, (d1 >> 5) & 7, (d2 >> 7) & 1, (d2 >> 6) & 1, d2 & 63, d3, s_last_cmd);
+        CLogger::Get ()->Write ("vmpu68", LogWarning, "bus wait gave up (2^24 polls) %s", (const char *) s_hang_last); });
     CLogger::Get ()->Write (FromKernel, LogNotice, "board: %s (%s), console UART%u",
                     vmpu68_board ()->name, how, vmpu68_board ()->uart);
     if (bOK) bOK = m_CDCGadget.Initialize ();
@@ -866,6 +1004,9 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
     CString R;
     const char *p = line;
     while (*p == ' ') p++;
+    strncpy (s_last_cmd, p, sizeof s_last_cmd - 1); s_last_cmd[sizeof s_last_cmd - 1] = 0;   // crash record: what was running if we hang
+    s_con_t0 = CTimer::GetClockTicks (); s_con_active = 1;
+    struct ConDone { ~ConDone () { s_con_active = 0; s_stall_logged = FALSE; } } con_done;
 
     if (p[0] == 's' && p[1] == 't')                        // st: status
     {
@@ -1514,8 +1655,8 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
     {
         p += 4;
         while (*p == ' ') p++;
-        if (*p >= '0' && *p <= '9') { emu_quiesce (); hw_set_bus_slow (parse_num (p) ? 1 : 0); }
-        R.Format ("bus cycle %s\r\n", hw_bus_slow () ? "5 clocks (slow)" : "4 clocks");
+        if (*p >= '0' && *p <= '9') { emu_quiesce (); s_bus_slow_pref = parse_num (p) ? 1 : 0; hw_set_bus_slow (s_bus_slow_pref); }
+        R.Format ("bus cycle %s%s\r\n", hw_bus_slow () ? "5 clocks (slow)" : "4 clocks", s_bus_slow_pref ? " (kept across resets)" : "");
     }
     else if (p[0] == 'a' && p[1] == 's')                   // as <0|1>: 2-write bus cycle mode (faster)
     {
@@ -1628,6 +1769,51 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         R.Format ("wq %s: limit %u, depth %u (max %u) issued %llu, full waits %u, syncs %u (waited %u, %llu us, longest %llu us, timeouts %u), worker strobe time %llu ms\r\n",
                   w.on ? "on" : "off", w.limit, w.depth, w.max_depth, (unsigned long long) w.issued, w.full_waits, w.syncs, w.sync_waits,
                   (unsigned long long) (w.sync_t / 54), (unsigned long long) (w.sync_max_t / 54), w.sync_timeouts, (unsigned long long) (w.issue_t / 54000));
+    }
+    else if (p[0] == 'v' && p[1] == 's' && (p[2] == 0 || p[2] == ' '))   // vs: virtual SCSI port / worker statistics
+    {
+        vscsi_stats (R);
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'm')    // vsm <id> <path> [ro]: mount a virtual SCSI image (saved to vmpu68.cfg)
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned id = parse_num (p); while (*p == ' ') p++;
+        char path[128]; unsigned n = 0; while (*p && *p != ' ' && n < sizeof path - 1) path[n++] = *p++; path[n] = 0;
+        while (*p == ' ') p++;
+        int ro = (p[0] == 'r' && p[1] == 'o');
+        int rc = vscsi_mount (id, path, ro != 0);
+        if (rc == 0) { cfg_set_vscsi (id, path, ro); cfg_save (); }
+        R.Format ("vscsi: mount ID %u %s: %s\r\n", id, path, rc == 0 ? "ok" : rc == -1 ? "bad id/path" : rc == -2 ? "cannot open" : "too small");
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'e')    // vse <id>: eject
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned id = parse_num (p);
+        int rc = vscsi_eject (id);
+        if (rc == 0) { cfg_set_vscsi (id, "", 0); cfg_save (); }
+        R.Format ("vscsi: eject ID %u: %s\r\n", id, rc == 0 ? "ok" : "bad id");
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'l')    // vsl [n]: the last n virtual SCSI commands (up to 512); vsl 0 clears
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned n = (*p >= '0' && *p <= '9') ? parse_num (p) : 64;
+        vscsi_log (n, R);
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'b')    // vsb <id> [MB]: FatFs/EMMC throughput on the mounted image (core 0, blocks the loop)
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned id = parse_num (p); while (*p == ' ') p++;
+        unsigned mb = parse_num (p);
+        vscsi_bench (id, mb, R);
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'n')    // vsn <path> <MB>: new blank image
+    {
+        p += 3; while (*p == ' ') p++;
+        char path[128]; unsigned n = 0; while (*p && *p != ' ' && n < sizeof path - 1) path[n++] = *p++; path[n] = 0;
+        while (*p == ' ') p++;
+        unsigned mb = parse_num (p);
+        int rc = vscsi_new_image (path, mb);
+        R.Format ("vscsi: new %s %u MB: %s (%d)\r\n", path, mb, rc == 0 ? "ok" : "failed", rc);
     }
     else if (p[0] == 'e' && p[1] == 's' && p[2] == 'c')    // esc [n]: last n CRTC scroll register writes: time, us since the last IACK (vector), HSYNC level at the write
     {
@@ -2110,6 +2296,7 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         emu_ensure ();
         emu_quiesce ();
         emu68k_reset ();
+    vscsi_on_reset ();                         // ejected virtual IDs go back to the real bus
         R = "emu reset\r\n";
     }
     else if (p[0] == 'e' && p[1] == 'r' && p[2] == 'n')    // ern <cycles>
@@ -2223,6 +2410,127 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         vmpu68_smi_flags (f);
         int r = was ? hw_set_smi (1) : 0;
         R.Format ("smi flags %u: %s\r\n", vmpu68_smi_get_flags (), r == 0 ? (was ? "on, FPGA answers" : "set (SMI off)") : "the FPGA did not answer - back to GPIO");
+    }
+    else if (p[0] == 'b' && p[1] == 'o' && p[2] == 'p' && p[3] == 's')   // bops [n]: the last n bus operations of the Pi side (oldest first; r/w read/write, W queued write, i IACK; b/w byte/word)
+    {
+        p += 4;
+        while (*p == ' ') p++;
+        if (*p == 'f')                                        // bops f: the ops before the emulator's last bus fault
+        {
+            R.Format ("bus ops before the last emulator fault (%u):\r\n", hw_ops_snap_n);
+            for (unsigned k = 0; k < hw_ops_snap_n; k++)
+            {
+                const hw_op_t &o = hw_ops_snap[k];
+                CString L; L.Format ("  %c%c %06X = %04X st %02X%s\r\n", "rwWi"[o.kind & 3], (o.kind & 4) ? 'w' : 'b', o.addr, o.data, o.st, (o.st & 2) ? " FAULT" : "");
+                R.Append (L);
+            }
+        }
+        else
+        {
+            unsigned n = parse_num (p);
+            if (!n || n > HW_OPS) n = 24;
+            unsigned from = hw_op_n > n ? hw_op_n - n : 0;
+            R.Format ("bus ops %u-%u of %u:\r\n", from, hw_op_n, hw_op_n);
+            for (unsigned k = from; k < hw_op_n; k++)
+            {
+                const hw_op_t &o = hw_ops[k & (HW_OPS - 1)];
+                CString L; L.Format ("  %c%c %06X = %04X st %02X%s\r\n", "rwWi"[o.kind & 3], (o.kind & 4) ? 'w' : 'b', o.addr, o.data, o.st, (o.st & 2) ? " FAULT" : "");
+                R.Append (L);
+            }
+        }
+    }
+    else if (p[0] == 'b' && p[1] == 'w' && p[2] == 'a' && p[3] == 'i' && p[4] == 't')   // bwait: bus waits that gave up (last report)
+    {
+        R.Format ("bus waits that gave up: %u%s%s\r\nstalls seen by the sampler: %u%s", s_hang_n, s_hang_n ? " - last: " : "", s_hang_n ? (const char *) s_hang_last : "", s_stall_n, s_stall_n ? " - last: " : "\r\n");
+        if (s_stall_n) { CString L; L.Format ("cmd '%s' running %u ms at uptime %us, hw_bus_read phase %u (1 wq sync, 2 lock wait, 3 reading) addr %06X\r\n", s_stall_cmd, s_stall_ms, s_stall_uptime, s_stall_phase, s_stall_addr); R.Append (L); }
+    }
+    else if (p[0] == 'c' && p[1] == 'r' && p[2] == 'a' && p[3] == 's' && p[4] == 'h')   // crash: crash record state (RAM record magic/len, SD copies written)
+    {
+        crashrec_t *b = (crashrec_t *) (uintptr) CRASHREC_ADDR;
+        crashrec_snapshot ("manual");
+        R.Format ("crash record: magic %s, len %u, SD copies %u (failed %u), last cmd '%s'\r\n",
+                  b->magic == CRASHREC_MAGIC ? "ok" : "none", b->len, s_crashrec_sd_writes, s_crashrec_sd_fail, s_last_cmd);
+    }
+    else if (p[0] == 'd' && p[1] == 'm' && p[2] == 'a' && p[3] == 't')   // dmat <src> <dst> <words> [c]: time a DMAC ch2 memory-to-memory transfer (c = cycle steal, else burst)
+    {
+        p += 4;
+        unsigned src = parse_num (p), dst = parse_num (p), words = parse_num (p);
+        while (*p == ' ') p++;
+        int cs = (*p == 'c');
+        const unsigned CH = 0xE84080u;                     // HD63450 channel 2 (the user channel, IOCS _DMAMOVE)
+        hw_bus_write (CH + 0x00, 0, 0xFF);                 // CSR: clear
+        hw_bus_write (CH + 0x04, 0, cs ? 0x88 : 0x08);     // DCR: cycle steal / burst, 68000 dual-address, 16-bit port
+        hw_bus_write (CH + 0x05, 0, cs ? 0x10 : 0x11);     // OCR: memory -> device, word, auto-request (limited / max rate)
+        hw_bus_write (CH + 0x06, 0, 0x05);                 // SCR: MAR++, DAR++
+        hw_bus_write (CH + 0x0A, 1, (uint16_t) words);
+        hw_bus_write (CH + 0x0C, 1, (uint16_t) (src >> 16)); hw_bus_write (CH + 0x0E, 1, (uint16_t) src);
+        hw_bus_write (CH + 0x14, 1, (uint16_t) (dst >> 16)); hw_bus_write (CH + 0x16, 1, (uint16_t) dst);
+        hw_bus_write (CH + 0x29, 0, 0x05); hw_bus_write (CH + 0x31, 0, 0x05); hw_bus_write (CH + 0x2D, 0, 0x03);
+        unsigned t0 = CTimer::GetClockTicks ();
+        hw_bus_write (CH + 0x07, 0, 0x80);                 // CCR: STR
+        uint16_t csr = 0; unsigned polls = 0;
+        do { CTimer::SimpleusDelay (200); hw_bus_read (CH + 0x00, 0, &csr); polls++; } while (!(csr & 0x80) && polls < 50000);
+        unsigned us = CTimer::GetClockTicks () - t0;
+        uint16_t cer = 0; hw_bus_read (CH + 0x01, 0, &cer);
+        R.Format ("dmat %06X -> %06X x%u (%s): %u us = %u ns/word, CSR %02X CER %02X (%u polls)\r\n",
+                  src, dst, words, cs ? "cycle steal" : "burst", us, words ? us * 1000 / words : 0, csr & 0xFF, cer & 0xFF, polls);
+    }
+    else if (p[0] == 's' && p[1] == 'l' && p[2] == 'd')    // sld [c]: PSRAM slave-path debug counters (c = clear first)
+    {
+        p += 3;
+        while (*p == ' ') p++;
+        if (*p == 'c') { hw_slave_dbg (1, 1); hw_slave_dbg (0, 0); R = "slave debug: counters cleared\r\n"; }
+        else
+        {
+            unsigned a = hw_slave_dbg (1, 0), b = hw_slave_dbg (2, 0), c = hw_slave_dbg (3, 0);
+            hw_slave_dbg (0, 0);
+            R.Format ("slave debug: last cycle DTACK->AS negated %u ns%s | last write: be %u%u A6-A1 %02X data[7:0] %02X\r\n",
+                      a * 4 * 16, a == 255 ? " (or more)" : "", (b >> 7) & 1, (b >> 6) & 1, b & 63, c);   // page 1 = clocks/4 at ~62 MHz
+        }
+    }
+    else if (p[0] == 'd' && p[1] == 't' && p[2] == 'k')    // dtk [0|1]: core 2.1 DTACK driver self test (Q4 -> bus DTACK) seen through the FPGA's own DTACK input
+    {
+        p += 3;
+        while (*p == ' ') p++;
+        if (*p == '1')
+        {
+            emu_quiesce ();
+            int r = hw_dtack_test (1);
+            R.Format ("dtack test: holding DTACK low (emulator stopped, 'dtk 0' releases) - DTACK input %s\r\n",
+                      r == 1 ? "LOW: the driver reaches the bus" : r == 0 ? "HIGH: the driver does NOT reach the bus" : "n/a (mock)");
+        }
+        else if (*p == '0')
+        {
+            hw_dtack_test (0);
+            s_emu_run = TRUE; DataSyncBarrier ();
+            R = "dtack test: released, emulator running\r\n";
+        }
+        else
+        {
+            emu_quiesce ();
+            int r = hw_dtack_test (1);
+            hw_dtack_test (0);
+            s_emu_run = TRUE; DataSyncBarrier ();
+            R.Format ("dtack test: DTACK input %s\r\n",
+                      r == 1 ? "LOW while driving - Q4 reaches the CPU socket DTACK (socket wiring)" : r == 0 ? "HIGH while driving - expected with the EXDTACK (R24 / slot A35) wiring: the ASA only forwards it inside a bus cycle, so check with a DMA transfer and 'sld' instead" : "n/a (mock)");
+        }
+    }
+    else if (p[0] == 'p' && p[1] == 's' && p[2] == 'r')    // psram: core 2.1 PSRAM window state
+    {
+        unsigned b, t; int en, sl, pa;
+        hw_psram_get (&b, &t, &en, &sl, &pa);
+        R.Format ("psram: diag bit %u (1.0.0 bitstreams: always 1), scan %s, window %s %u-%u (64 KB blocks %02X-%02X), slave %s, passive %s, cfg psram=%u\r\n",
+                  hw_psram_present () ? 1u : 0u, s_psram_scan, en ? "on" : "off", b >> 4, t >> 4, b, t,
+                  sl ? "on" : "off", pa ? "on" : "off", cfg_psram ());
+    }
+    else if (p[0] == 'p' && p[1] == 'a' && p[2] == 's' && p[3] == 's')    // passive 0|1: riser 2.0 experiment - the FPGA stops driving the bus (a real CPU runs)
+    {
+        p += 7;
+        while (*p == ' ') p++;
+        unsigned b, t; int en, sl, pa;
+        hw_psram_get (&b, &t, &en, &sl, &pa);
+        if (*p >= '0' && *p <= '9') { emu_quiesce (); hw_psram_cfg (b, t, en, sl, parse_num (p) ? 1 : 0); hw_psram_get (&b, &t, &en, &sl, &pa); }
+        R.Format ("passive %s (the emulator is stopped while on)\r\n", pa ? "on" : "off");
     }
     else if (p[0] == 's' && p[1] == 'm' && p[2] == 'i' && p[3] == 'd')    // smid <ns>: spin before the first DONE poll of an SMI read
     {
@@ -3157,6 +3465,58 @@ static uint32_t probe_main_ram (void)
     return size;
 }
 
+// core 2.1 PSRAM window scan: map [base, 12 MB) and check that the window
+// really stores data.  The CTRL diagnostics bit (VDIAG_PSRAM) is not enough:
+// on bitstreams before 1.1 the same bit was 'armed' and reads 1, so a 2.0.1
+// board on 1.0.0 looked like it had 12 MB.  Reads the last word of every
+// megabyte in the window (an unpopulated address ends in a bus error) and
+// writes two patterns to three words (first, middle, last), reading them
+// back after all three were written so an echo of the data latch or a
+// non-storing address fails too.  The words are put back.  Window off on
+// failure.  Runs before the IPL, on the free bus; ~20 bus cycles.
+static boolean probe_psram_window (uint32_t base, char *pWhy, unsigned nWhy)
+{
+    hw_psram_cfg (base >> 16, 0xC0, 1, 1, 0);
+    for (uint32_t top = base + 0x100000; top <= 0xC00000; top += 0x100000)
+    {
+        uint16_t v = 0;
+        hw_clear_fault ();
+        if (hw_bus_read (top - 2, 1, &v) & VST_FAULT)
+        {
+            hw_clear_fault ();
+            CString S; S.Format ("bus error at %06X", (unsigned) (top - 2));
+            strncpy (pWhy, (const char *) S, nWhy - 1); pWhy[nWhy - 1] = 0;
+            hw_psram_cfg (0, 0, 0, 0, 0);
+            return FALSE;
+        }
+    }
+    const uint32_t addr[3] = { base, (base + 0xC00000) / 2 & ~1u, 0xC00000 - 2 };
+    const uint16_t pat[2] = { 0x5A3C, 0xA5C3 };
+    uint16_t save[3];
+    boolean ok = TRUE;
+    for (int i = 0; i < 3; i++) hw_bus_read (addr[i], 1, &save[i]);
+    for (int p = 0; p < 2 && ok; p++)
+    {
+        for (int i = 0; i < 3; i++) hw_bus_write_sync (addr[i], 1, (uint16_t) (pat[p] + i));
+        for (int i = 0; i < 3 && ok; i++)
+        {
+            uint16_t v = 0;
+            hw_clear_fault ();
+            uint16_t st = hw_bus_read (addr[i], 1, &v);
+            if ((st & VST_FAULT) || v != (uint16_t) (pat[p] + i))
+            {
+                CString S; S.Format ("%06X wrote %04X read %04X%s", (unsigned) addr[i], (unsigned) (pat[p] + i), v, (st & VST_FAULT) ? " (bus error)" : "");
+                strncpy (pWhy, (const char *) S, nWhy - 1); pWhy[nWhy - 1] = 0;
+                hw_clear_fault ();
+                ok = FALSE;
+            }
+        }
+    }
+    for (int i = 0; i < 3; i++) hw_bus_write_sync (addr[i], 1, save[i]);
+    if (!ok) hw_psram_cfg (0, 0, 0, 0, 0);
+    return ok;
+}
+
 // Bus clock in MHz, from the FPGA's heartbeat: VDIAG_HB_CLK16 toggles every
 // 2^19 bus clocks (32.8 ms at 16 MHz, 52.4 ms at 10 MHz), so two toggles are
 // 2^20 clocks.  Takes 70-110 ms; 0 when the clock is not running.
@@ -3273,16 +3633,34 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     m_Timer.MsDelay (bPowerOn ? 200 : 20);     // settle: supplies at power-on, peripherals after a button reset
     // main RAM size: vmpu68.cfg "ram=" or the bus probe; a change remaps the
     // shadow (the resync below then reads the whole of it)
-    uint32_t ram = cfg_ram_mb () ? cfg_ram_mb () << 20 : probe_main_ram ();
+    // core 2.1 PSRAM: probe the onboard RAM with the window off, then map the
+    // PSRAM above it up to 12 MB (the 68000's main RAM limit) and serve
+    // other masters there as a bus slave (DMA into the extension).
+    hw_psram_cfg (0, 0, 0, 0, 0);
+    uint32_t onboard = probe_main_ram ();
+    s_psram_on = FALSE;
+    char why[64] = "";
+    if (cfg_psram () && onboard && onboard < 0xC00000)
+    {
+        s_psram_on = probe_psram_window (onboard, why, sizeof why);   // scanned, never taken from the diagnostics bit alone
+        strncpy (s_psram_scan, s_psram_on ? "passed" : why, sizeof s_psram_scan - 1); s_psram_scan[sizeof s_psram_scan - 1] = 0;
+    }
+    else
+        strncpy (s_psram_scan, cfg_psram () ? "skipped (onboard RAM 12 MB or not readable)" : "off by cfg psram=0", sizeof s_psram_scan - 1);
+    uint32_t ram = cfg_ram_mb () ? cfg_ram_mb () << 20 : (s_psram_on ? 0xC00000 : onboard);
     boolean bRamChanged = FALSE;
     if (ram && ram != emu68k_ram_size ())
     {
         emu68k_set_ram_size (ram);
         bRamChanged = TRUE;
     }
-    CLogger::Get ()->Write (FromKernel, LogNotice, "main RAM %u MB (%s)%s", emu68k_ram_size () >> 20,
+    CLogger::Get ()->Write (FromKernel, LogNotice, "main RAM %u MB (%s)%s%s", emu68k_ram_size () >> 20,
                     cfg_ram_mb () ? "vmpu68.cfg" : ram ? "probed" : "probe found nothing, kept",
-                    bRamChanged ? " - shadow remapped" : "");
+                    s_psram_on ? " - onboard " : "", bRamChanged ? " - shadow remapped" : "");
+    if (s_psram_on)
+        CLogger::Get ()->Write (FromKernel, LogNotice, "PSRAM window: %u MB-%u MB (onboard RAM %u MB, scan passed)", onboard >> 20, 12u, onboard >> 20);
+    else if (cfg_psram () && onboard && onboard < 0xC00000)
+        CLogger::Get ()->Write (FromKernel, LogNotice, "PSRAM window: off (scan failed: %s; diagnostics bit %u)", why, hw_psram_present () ? 1u : 0u);
     // Bus clock: the XVI's 10/16 MHz switch (or an overclock).  The timing
     // class for the measured clock comes from SD:/vmpu68-bus.json (or the
     // built-in 10/16 MHz defaults): I/O spacing, the first-poll wait, ai
@@ -3294,30 +3672,54 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     apply_smi_cfg ();                          // SMI strobe timing follows the clock class (10 vs 16 MHz)
     const cfg_bus_class *c = s_bus_cls;
     hw_set_wr_ai (c->ai);
+    int slow_on = (c->slow >= 0 ? c->slow : (c->min_mhz10 < 130)) || s_bus_slow_pref;   // 10 MHz: 5-clock cycles (docs 55); 'slow 1' pins it
+    hw_set_bus_slow (slow_on);
     vmpu68_set_wait_ns (c->wait_ns);
     emu68k_set_io_mhz (c->io_mhz, 0);
     s_bus_setup_auto = -1;
     int setup = c->wr_setup >= 0 ? hw_set_wr_setup (c->wr_setup) : (s_bus_setup_auto = probe_wr_setup ());
-    CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock %u.%u MHz: class >= %u.%u MHz (%s) - wr_setup +%d%s, wait %u ns, io %u MHz, ai %s",
+    CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock %u.%u MHz: class >= %u.%u MHz (%s) - wr_setup +%d%s, wait %u ns, io %u MHz, ai %s, %s-clock cycles%s",
                     s_bus_mhz10 / 10, s_bus_mhz10 % 10, c->min_mhz10 / 10, c->min_mhz10 % 10, cfg_bus_source (),
-                    setup, c->wr_setup < 0 ? " (probed)" : "", c->wait_ns, c->io_mhz, c->ai ? "on" : "off");
+                    setup, c->wr_setup < 0 ? " (probed)" : "", c->wait_ns, c->io_mhz, c->ai ? "on" : "off", slow_on ? "5" : "4", c->slow < 0 ? " (auto)" : "");
     emu68k_snoop_apply ();
-    unsigned rambad = emu68k_wb_enabled () ? 0 : emu68k_shadow_check ();   // write-back: the real RAM lags the shadow by design
+    // write-back: the real RAM lags the shadow by design; power-on: the RAM holds garbage, nothing to compare
+    unsigned rambad = (emu68k_wb_enabled () || bPowerOn) ? 0 : emu68k_shadow_check ();
     uint32_t first = ~0u;
     unsigned rombad = 0;
     unsigned t0 = m_Timer.GetTicks ();
     int sync = 0;
-    if (rambad || bPowerOn || bRamChanged)
+    if (bPowerOn)
     {
         rombad = emu68k_rom_check (&first);    // diagnostics: how many pages were poisoned
+        emu68k_shadow_clear ();                // the RAM is garbage after a power-on: zeros, not a 12 MB bus read (4.4 s)
+    }
+    else if (rambad || bRamChanged)
+    {
+        rombad = emu68k_rom_check (&first);
         sync = emu68k_sync_shadow (0, emu68k_ram_size ());
     }
     emu68k_rom_invalidate ();
     CLogger::Get ()->Write (FromKernel, LogNotice, "%s: booting (st=%04x, reset_in released after %u ms%s, [0]=%04x [4]=%04x rom=%04x [0]'=%04x, ram check bad=%u%s, rom cache bad=%u first=%06X, %u ms)",
                     pWhy, nStatus, waited, waited >= 5000 ? " - TIMEOUT" : "", m0, m1, m2, m3, rambad,
-                    (rambad || bPowerOn || bRamChanged) ? (sync ? " - resync FAILED" : " - resynced") : "",
+                    bPowerOn ? " - shadow cleared" : (rambad || bRamChanged) ? (sync ? " - resync FAILED" : " - resynced") : "",
                     rombad, first, (m_Timer.GetTicks () - t0) * 1000 / HZ);
     emu68k_reset ();
+    vscsi_on_reset ();                         // ejected virtual IDs go back to the real bus
+    // SRAM $ED0008 = the main memory size the IPL and Human68k use (what
+    // SWITCH.X MEMORY sets).  The IPL trusts it instead of probing, so the
+    // PSRAM window (or a smaller cfg ram=) stays invisible until it is updated.
+    if (!hw_is_mock ())
+    {
+        u8 cur[4]; emu68k_sram_read (0xED0008u, cur, 4);
+        uint32_t have = ((uint32_t) cur[0] << 24) | ((uint32_t) cur[1] << 16) | ((uint32_t) cur[2] << 8) | cur[3];
+        uint32_t want = emu68k_ram_size ();
+        if (want && want <= 0xC00000 && have != want)
+        {
+            u8 nv[4] = { (u8) (want >> 24), (u8) (want >> 16), (u8) (want >> 8), (u8) want };
+            unsigned bad = emu68k_sram_write (0xED0008u, nv, 4);
+            CLogger::Get ()->Write (FromKernel, LogNotice, "SRAM memory size: %u MB -> %u MB (IPL/Human68k main memory)%s", have >> 20, want >> 20, bad ? " - SRAM WRITE FAILED" : "");
+        }
+    }
     if (cfg_sramboot ())                       // boot screen program: (re)install when missing or outdated
     {
         int st = vmpu68_sramboot_state ();
@@ -3406,6 +3808,7 @@ TShutdownMode CKernel::Run (void)
     hw_wq_enable (0);                          // core-2 write queue off by default since 0.1.18 (docs 31: latency for raster/timer IRQ handlers); 'wq 1' turns it on for experiments
 #ifdef VMPU68_WITH_EMU
     emu_ensure ();                             // allocate the shadow on core 0
+    vscsi_init ();                             // the virtual SCSI test disk, before core 3 starts
     if (!m_EmuCore.Initialize ())
         CLogger::Get ()->Write (FromKernel, LogError, "multicore init failed");
 #endif
@@ -3430,6 +3833,9 @@ TShutdownMode CKernel::Run (void)
 #ifdef VMPU68_WATCHDOG
         m_Watchdog.Start (15);                 // reload
 #endif
+        { static unsigned nLastBB = 0, nLastSD = 0; unsigned now = CTimer::GetClockTicks ();   // crash record: a snapshot every 250 ms, so a hang
+          if (now - nLastBB >= 250000) { nLastBB = now; crashrec_snapshot ("snapshot"); }      // (watchdog reset, no panic) still leaves a trace
+          if (now - nLastSD >= 1000000) { nLastSD = now; crashrec_sd (); } }                   // and a copy on the card every second
         m_Scheduler.Yield ();                  // run network tasks
 
         // Wi-Fi after the machine is served: once the emulator runs (or the
@@ -3515,6 +3921,8 @@ TShutdownMode CKernel::Run (void)
             m_Net.GetConfig ()->GetIPAddress ()->Format (&IP);
             CLogger::Get ()->Write (FromKernel, LogNotice, "WLAN up: http://%s/",
                             (const char *) IP);
+            netfetch_init (&m_Net);            // LAN pulls (/api/fetch) use the same network stack
+            lanlabel_init (&m_Net);
             new CVmpuWebServer (&m_Net);
             m_bWebStarted = TRUE;
             g_pDiscovery = new CDiscovery (&m_Net);   // LAN beacon (vhd68/vfd68 style)
@@ -3527,6 +3935,7 @@ TShutdownMode CKernel::Run (void)
         }
         if (g_pDiscovery)
             g_pDiscovery->Poll ();
+        lanlabel_poll ();                          // VMPU68.X -d asked who is at which SCSI ID / FDD: ask vhd68 / vfd68
 
         // UART console
         char buf[64];

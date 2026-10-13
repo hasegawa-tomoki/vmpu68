@@ -1,6 +1,6 @@
 # vmpu68 FPGA build + simulation
-RTL   = ../rtl/vmpu68_top.v ../rtl/pi_if.v ../rtl/bus_engine.v ../rtl/e_clock.v ../rtl/fwft_fifo.v
-TB    = ../sim/tb_top.v ../sim/sb_pll40_model.v
+RTL   = ../rtl/vmpu68_top.v ../rtl/pi_if.v ../rtl/bus_engine.v ../rtl/e_clock.v ../rtl/fwft_fifo.v ../rtl/psram_qpi.v
+TB    = ../sim/tb_top.v ../sim/sb_pll40_model.v ../sim/psram_model.v
 TOP   = vmpu68_top
 PCF   = vmpu68.pcf
 DEV   = --hx4k

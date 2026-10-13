@@ -72,7 +72,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     input  wire        lds_n_i,
     input  wire        rw_i,
 
-    output reg  [15:0] ld_o,
+    output reg  [15:0] ld_o,       // (combinational: main engine or slave path)
     output reg         ld_drive,
     input  wire [15:0] ld_i,
 
@@ -96,7 +96,37 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     output wire [47:0] snoop_rec,
     input  wire        snoop_pop,
     output wire        snoop_ovf,
-    input  wire        snoop_rst
+    input  wire        snoop_rst,
+
+    // ---- PSRAM window (core 2.1) and the riser 2.0 passive mode ----
+    // Cycles whose address block (64 KB) is in [ps_base, ps_top) go to the
+    // PSRAM instead of the X68000 bus: the Pi's own commands (and prefetch
+    // streams) through an internal path, and - with ps_slave - other
+    // masters' cycles (DMAC, a real 68000 on the riser) answered as a bus
+    // slave with DTACK (open-drain, dtack_drv) and read data.  The PSRAM
+    // byte address is the bus address (the window never maps below 2 MB on
+    // a real machine, so the first blocks of the chip simply stay unused).
+    input  wire        ps_en,
+    input  wire [7:0]  ps_base,
+    input  wire [7:0]  ps_top,
+    input  wire        ps_slave,
+    input  wire        passive,     // never drive the bus or grant it: a real CPU runs (riser 2.0)
+    input  wire        dtack_test,  // hold the DTACK driver on while idle (driver self test, see pi_if)
+    input  wire [1:0]  dbg_sel,     // slave-path debug page (see pi_if); dbg_clr clears the counters
+    input  wire        dbg_clr,
+    output reg  [7:0]  dbg_byte,
+    output wire        dtack_drv,
+    output wire        ps_req,
+    output wire        ps_we,
+    output wire        ps_two,      // read 2 words (slave read-ahead)
+    output wire [23:0] ps_addr,
+    output wire [15:0] ps_wdata,
+    output wire [1:0]  ps_be,
+    input  wire [15:0] ps_rdata,
+    input  wire [15:0] ps_rdata2,
+    input  wire [2:0]  ps_fst,      // controller frame state (debug page 1)
+    input  wire        ps_ack,
+    input  wire        ps_busy
 );
 
     // Buffer turnaround rule: DIR may only change while the buffer's OE is
@@ -106,8 +136,38 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     reg a_dir, a_oe_n, d_dir, d_oe_n;
     assign buf_a_dir  = a_dir;
     assign buf_a_oe_n = a_oe_n;
-    assign buf_d_dir  = d_dir;
-    assign buf_d_oe_n = d_oe_n;
+    // while another master owns the bus the slave path (below) controls the
+    // D buffer: it has to drive read data from the PSRAM onto the bus
+    reg sl_dir = 1'b0, sl_oe_n = 1'b0, sl_drive = 1'b0;
+    reg [15:0] sl_ld;
+    reg [15:0] ld_o_m;
+    reg        ld_drive_m;
+    assign buf_d_dir  = own ? d_dir  : sl_dir;
+    assign buf_d_oe_n = own ? d_oe_n : sl_oe_n;
+    always @* begin
+        ld_o     = own ? ld_o_m     : sl_ld;
+        ld_drive = own ? ld_drive_m : sl_drive;
+    end
+
+    // PSRAM request: from the main engine while it owns the bus, from the
+    // slave path otherwise (two register sets, one driver per block)
+    reg        ps_req_m = 1'b0, ps_we_m = 1'b0, ps_req_s = 1'b0, ps_we_s = 1'b0, ps_two_s = 1'b0;
+    reg [23:0] ps_addr_m = 24'd0, ps_addr_s = 24'd0;
+    reg [15:0] ps_wdata_m = 16'd0, ps_wdata_s = 16'd0;
+    reg [1:0]  ps_be_m = 2'b00, ps_be_s = 2'b00;
+    // (the controller latches the fields with the request pulse; the two
+    // never pulse together: the engine only asks while the slave path is idle)
+    assign ps_req   = ps_req_m | ps_req_s;
+    assign ps_two   = !ps_req_m && ps_two_s;
+    assign ps_we    = ps_req_m ? ps_we_m    : ps_we_s;
+    assign ps_addr  = ps_req_m ? ps_addr_m  : ps_addr_s;
+    assign ps_wdata = ps_req_m ? ps_wdata_m : ps_wdata_s;
+    assign ps_be    = ps_req_m ? ps_be_m    : ps_be_s;
+
+    // PSRAM window test, on the 64 KB block number
+    function hit(input [7:0] blk);
+        hit = ps_en && (blk >= ps_base) && (blk < ps_top);
+    endfunction
 
     // ---- input synchronizers (fast domain: ~30ns latency) ----
     wire dtack_s, berr_s, vpa_s, br_s, bgack_s;
@@ -116,6 +176,9 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     sync2 s2 (.clk(clk), .d(~vpa_n),   .q(vpa_s));
     sync2 s3 (.clk(clk), .d(~br_n),    .q(br_s));
     sync2 s4 (.clk(clk), .d(~bgack_n), .q(bgack_s));
+
+    reg  [47:0] snoop_hold;             // (declared early: Icarus 13 wants declaration before use)
+    reg         snoop_push;
 
     // ---- posted command FIFO ----
     // Each entry records whether BR was already asserted when the Pi posted
@@ -158,9 +221,11 @@ module bus_engine #(parameter SNOOP_AW = 9) (
                ST_GRUN   = 4'd11,
                ST_UNGISO = 4'd12,
                ST_END3   = 4'd13,
-               ST_WPRE   = 4'd15;   // wr_setup: one tick with data driven, before AS
+               ST_WPRE   = 4'd15,   // wr_setup: one tick with data driven, before AS
+               ST_PS     = 5'd16,   // a Pi command served from the PSRAM (no bus cycle)
+               ST_PASSIVE = 5'd17;  // riser 2.0: a real CPU owns the bus; we only snoop and serve the window
 
-    reg [3:0]  st = ST_IDLE;
+    reg [4:0]  st = ST_IDLE;
     reg [11:0] wdog;
     reg [1:0]  pre_cnt;               // WPRE ticks left (wr_setup)
     reg        p_a0; reg [15:0] p_wdata;
@@ -215,8 +280,9 @@ module bus_engine #(parameter SNOOP_AW = 9) (
 
     wire exec_busy = (st == ST_ADDR) || (st == ST_ADDR1) || (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_WPRE) ||
                      (st == ST_STROBE) || (st == ST_WAIT) || (st == ST_VPA) ||
-                     (st == ST_END) || (st == ST_END2) || (st == ST_END3);
-    wire fast_st   = (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_END2) || (st == ST_END3);
+                     (st == ST_END) || (st == ST_END2) || (st == ST_END3) || (st == ST_PS);
+    wire fast_st   = (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_END2) || (st == ST_END3) ||
+                     (st == ST_PS) || (st == ST_PASSIVE);
     // A write always ends on the falling-edge phase (4-clock tail, strobes
     // negated a 68000's S7 after DTACK): with END on tick16 the strobes
     // stay asserted half a bus clock longer after the CRTC's DTACK, and the
@@ -229,17 +295,24 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     // speculative fetches are not "busy" for the Pi: it waits on pf_count
     assign busy = cmd_rdy || (exec_busy && !p_spec) || start;
 
+    reg dtack_drv_r;                 // the slave path's DTACK (dtack_drv also carries the self test)
+    reg [3:0] dbg_ashit = 4'd0, dbg_start = 4'd0, dbg_dtack = 4'd0, dbg_berr = 4'd0;   // slave-path debug counters
+    reg [9:0] dbg_hold = 10'd0;      // clocks from our DTACK assertion to the master's AS negation (last cycle; /4 in page 1)
+    reg [7:0] dbg_hold_q = 8'd0;
+    reg [1:0] dbg_wbe = 2'd0; reg [5:0] dbg_waddr = 6'd0; reg [7:0] dbg_wdata = 8'd0;   // last slave write (debug pages 2/3)
+    reg dbg_as_prev = 1'b0, dbg_berr_prev = 1'b0, dbg_dt_prev = 1'b0;
     initial begin
         own = 1'b1; bg_n = 1'b1;
         as_n_o = 1'b1; uds_n_o = 1'b1; lds_n_o = 1'b1; rw_o = 1'b1;
-        ld_drive = 1'b0; vma_req = 1'b0; cmd_pop = 1'b0; snoop_push = 1'b0;
+        ld_drive_m = 1'b0; vma_req = 1'b0; cmd_pop = 1'b0; snoop_push = 1'b0;
+        dtack_drv_r = 1'b0;
+        dbg_byte = 8'h00;
         berr_flag = 1'b0; timeout_flag = 1'b0; vpa_flag = 1'b0;
         a_dir = 1'b1; a_oe_n = 1'b0; d_dir = 1'b0; d_oe_n = 1'b0;
     end
 
     // ---- snoop FIFO ----
     reg  [47:0] snoop_din;
-    reg         snoop_push;
     wire snoop_afull, snoop_full, snq_rdy, snq_pop;
     wire [47:0] snq_rec;
     // grant DMA only with room for a whole burst (X68000 DMAC bursts a
@@ -341,7 +414,6 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     wire cyc_s    = ~as_s[1] & ~(uds_s[1] & lds_s[1]);   // strobed cycle, synchronised
     wire cyc_prev = ~as_s[2] & ~(uds_s[2] & lds_s[2]);
     wire cyc_end  = cyc_prev & ~cyc_s;
-    reg [47:0] snoop_hold;
     reg        snoop_wr;
     reg [1:0]  cyc_n;                                   // in-cycle samples - 1, saturating
     always @(posedge clk) begin
@@ -351,7 +423,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     end
     // (GRANT+BGACK covers the DMAC's first cycle before the tick-paced FSM
     // has reached GRUN)
-    wire snooping  = (st == ST_GRUN) || (st == ST_GRANT && bgack_s);
+    wire snooping  = (st == ST_GRUN) || (st == ST_GRANT && bgack_s) || (st == ST_PASSIVE);
     // A cycle seen while another master owns the bus is "armed" and pushed
     // at its end even if the FSM has already left GRUN by then: the DMAC
     // negates BGACK within a clock of its last AS negation, and the two
@@ -362,9 +434,198 @@ module bus_engine #(parameter SNOOP_AW = 9) (
         if (snooping && cyc_s) snoop_arm <= 1'b1;
         else if (cyc_end)      snoop_arm <= 1'b0;
 
+    // ---- bus slave for the PSRAM window ----
+    // Runs while another master owns the bus (a granted DMAC, or the real
+    // CPU in passive mode).  A read: start the PSRAM, turn the D buffer
+    // around, drive the word, assert DTACK, hold until AS is negated.  A
+    // write: wait for the data strobes (data valid), store, assert DTACK.
+    // A cycle that ends (AS negated) before we answer is simply dropped:
+    // the machine's own bus-error timer has terminated it.
+    localparam SL_IDLE = 4'd0, SL_RD = 4'd1, SL_RD_FLIP = 4'd2, SL_RD_ON = 4'd3,
+               SL_RD_PF = 4'd4, SL_HOLD = 4'd5, SL_REL1 = 4'd6, SL_REL2 = 4'd7, SL_WR0 = 4'd8;
+    reg [3:0] sl = SL_IDLE;
+    reg [11:0] ps_wd = 12'd0;        // ST_PS ack watchdog
+    assign dtack_drv = dtack_drv_r | (dtack_test && own && (st == ST_IDLE));   // self test: driver on while idle
+    wire sl_active = !own && ps_slave && ps_en;
+    wire sl_as     = ~as_s[1];                             // AS asserted (synchronised)
+    wire sl_ds     = ~uds_s[1] | ~lds_s[1];
+    // Read-ahead for the slave path: two 2-word buffers (pairs).  After a read
+    // of word X the words X+1.. are fetched two per PSRAM frame into a free
+    // pair, so a DMAC reading sequentially gets DTACK a few clocks after DS.
+    // Writes are posted (DTACK as soon as the data is captured and the frame
+    // started; the next access waits on ps_busy).  Any write drops the
+    // buffers.  A pair never spans the chip boundary (addr[23]).
+    reg        pa_v0 = 1'b0, pa_v1 = 1'b0, pb_v0 = 1'b0, pb_v1 = 1'b0;
+    reg [23:1] pa_a = 23'd0, pb_a = 23'd0;
+    reg [23:1] pa_a1 = 23'd0, pb_a1 = 23'd0, sp_a1 = 23'd0;   // = *_a + 1, registered (no adder in the compare paths)
+    reg [15:0] pa_d0 = 16'd0, pa_d1 = 16'd0, pb_d0 = 16'd0, pb_d1 = 16'd0;
+    reg        sp_out = 1'b0, sp_sel = 1'b0, sp_two = 1'b0, sp_dirty = 1'b0, sp_run = 1'b0;
+    reg [23:1] sp_a = 23'd0;          // address of the fetch in flight
+    reg [23:1] sp_next = 23'd0;       // next word to fetch for the stream
+    wire hit_a0 = pa_v0 && (pa_a == la_i);
+    wire hit_a1 = pa_v1 && (pa_a1 == la_i);
+    wire hit_b0 = pb_v0 && (pb_a == la_i);
+    wire hit_b1 = pb_v1 && (pb_a1 == la_i);
+    wire sp_hit = hit_a0 | hit_a1 | hit_b0 | hit_b1;
+    wire [15:0] sp_hit_d = hit_a0 ? pa_d0 : hit_a1 ? pa_d1 : hit_b0 ? pb_d0 : pb_d1;
+    wire soon0  = sp_out && (sp_a == la_i);
+    wire soon1  = sp_out && sp_two && (sp_a1 == la_i);
+    wire pa_free = !pa_v0 && !pa_v1 && !(sp_out && !sp_sel);
+    wire pb_free = !pb_v0 && !pb_v1 && !(sp_out && sp_sel);
+    // the controller shows busy only 2 clocks after a request lands: never
+    // issue in the clocks right after our own request (a request made then is
+    // ignored and a read-ahead would wait for an ack that never comes)
+    reg  ps_req_s_d = 1'b0;
+    wire ps_free = !ps_busy && !ps_req_s && !ps_req_s_d;
+    reg  [10:0] sp_wd = 11'd0;                           // read-ahead watchdog: drop a fetch that never acks
+    wire sp_can  = sp_run && !sp_out && ps_free && (pa_free || pb_free) && !own && ps_en;
+    wire sp_last = &sp_next[22:1];                          // last word of a chip: fetch 1
+    always @(posedge clk) begin
+        ps_req_s <= 1'b0; ps_two_s <= 1'b0; ps_req_s_d <= ps_req_s;
+        if (sp_out) sp_wd <= sp_wd + 11'd1; else sp_wd <= 11'd0;
+        if (sp_out && (&sp_wd)) begin sp_out <= 1'b0; sp_run <= 1'b0; end   // ~33 us without an ack: give up (safety, never seen in sim)
+        if (ps_ack && sp_out) begin                        // a read-ahead frame finished
+            sp_out <= 1'b0;
+            if (!sp_sel) begin pa_a <= sp_a; pa_a1 <= sp_a1; pa_d0 <= ps_rdata; pa_d1 <= ps_rdata2; pa_v0 <= !sp_dirty; pa_v1 <= !sp_dirty && sp_two; end
+            else         begin pb_a <= sp_a; pb_a1 <= sp_a1; pb_d0 <= ps_rdata; pb_d1 <= ps_rdata2; pb_v0 <= !sp_dirty; pb_v1 <= !sp_dirty && sp_two; end
+        end
+        // a write drops only the buffered words it overlaps (a DMAC copying
+        // PSRAM to PSRAM alternates reads and writes: the stream must survive)
+        if (ps_req && ps_we) begin
+            if (ps_addr[23:1] == pa_a || ps_addr[23:1] == pa_a1) begin pa_v0 <= 1'b0; pa_v1 <= 1'b0; end
+            if (ps_addr[23:1] == pb_a || ps_addr[23:1] == pb_a1) begin pb_v0 <= 1'b0; pb_v1 <= 1'b0; end
+            if (sp_out && (ps_addr[23:1] == sp_a || ps_addr[23:1] == sp_a1)) sp_dirty <= 1'b1;
+        end
+        if (!ps_en) begin pa_v0 <= 1'b0; pa_v1 <= 1'b0; pb_v0 <= 1'b0; pb_v1 <= 1'b0; sp_run <= 1'b0; end
+        case (sl)
+        SL_IDLE: begin
+            dtack_drv_r <= 1'b0;
+            // Decide only once a data strobe is on: R/W reaches its synchronizer
+            // a clock after AS at a back-to-back DMAC cycle boundary and a write
+            // seen as a read (bus driven, DTACK, nothing stored) lost 1 word in 10
+            // of a burst on the real machine.  A read has DS with AS; a write has
+            // DS a bus clock later, by which time R/W (and the data) are stable.
+            if (sl_active && sl_as && sl_ds && hit(la_i[23:16])) begin
+                if (rw_s[1]) begin                         // read
+                    if (sp_hit) begin                      // buffered: answer at once
+                        sl_ld <= sp_hit_d;
+                        if (hit_a0) pa_v0 <= 1'b0;
+                        if (hit_a1) begin pa_v0 <= 1'b0; pa_v1 <= 1'b0; end
+                        if (hit_b0) pb_v0 <= 1'b0;
+                        if (hit_b1) begin pb_v0 <= 1'b0; pb_v1 <= 1'b0; end
+                        sl_oe_n <= 1'b1;
+                        sl <= SL_RD_FLIP;
+                    end else if (soon0 || soon1) begin     // its frame is still running
+                        sl <= SL_RD_PF;
+                    end else if (ps_free) begin            // stream (re)start: fetch the word itself
+                        ps_req_s  <= 1'b1; ps_we_s <= 1'b0;
+                        ps_addr_s <= {la_i, 1'b0}; ps_be_s <= 2'b11;
+                        pa_v0 <= 1'b0; pa_v1 <= 1'b0; pb_v0 <= 1'b0; pb_v1 <= 1'b0;
+                        sp_next <= la_i + 23'd1; sp_run <= 1'b1;
+                        sl <= SL_RD;
+                    end
+                end else                                   // write: the other strobe may be a clock behind
+                    sl <= SL_WR0;                          // in its synchronizer: sample both next clock
+            end else if (sp_can && !passive) begin
+                ps_req_s <= 1'b1; ps_we_s <= 1'b0; ps_two_s <= !sp_last; ps_addr_s <= {sp_next, 1'b0}; ps_be_s <= 2'b11;
+                sp_out <= 1'b1; sp_sel <= !pa_free; sp_a <= sp_next; sp_a1 <= sp_next + 23'd1; sp_two <= !sp_last; sp_dirty <= 1'b0;
+                sp_next <= sp_next + (sp_last ? 23'd1 : 23'd2);
+            end
+        end
+        SL_WR0: begin                                      // data strobes settled, data valid
+            if (!sl_as) sl <= SL_IDLE;
+            else if (ps_free) begin                        // (a read-ahead frame may still be running)
+                ps_req_s   <= 1'b1; ps_we_s <= 1'b1;
+                ps_addr_s  <= {la_i, 1'b0};
+                ps_wdata_s <= ld_i;
+                ps_be_s    <= {~uds_s[1], ~lds_s[1]};
+                dtack_drv_r <= 1'b1;                       // posted: the frame completes on its own
+                sl <= SL_HOLD;
+            end
+        end
+        SL_RD: begin
+            if (!sl_as) sl <= SL_IDLE;                     // cycle gone (bus error timer)
+            else if (ps_ack) begin
+                sl_ld   <= ps_rdata;
+                sl_oe_n <= 1'b1;                           // buffer off before flipping
+                sl <= SL_RD_FLIP;
+            end
+        end
+        SL_RD_PF: begin                                    // waiting for the read-ahead holding this word
+            if (!sl_as) sl <= SL_IDLE;
+            else if (ps_ack && sp_dirty) sl <= SL_IDLE;    // overwritten while in flight: read it for real
+            else if (ps_ack) begin
+                sl_ld <= (sp_a == la_i) ? ps_rdata : ps_rdata2;   // (sp_a1 == la_i otherwise)
+                // the pair being filled: drop what was consumed (the fill above lands this clock too)
+                if (!sp_sel) begin pa_v0 <= 1'b0; if (sp_a1 == la_i) pa_v1 <= 1'b0; end
+                else         begin pb_v0 <= 1'b0; if (sp_a1 == la_i) pb_v1 <= 1'b0; end
+                sl_oe_n <= 1'b1;
+                sl <= SL_RD_FLIP;
+            end
+        end
+        SL_RD_FLIP: begin
+            sl_dir   <= 1'b1;
+            sl_drive <= 1'b1;
+            sl <= SL_RD_ON;
+        end
+        SL_RD_ON: begin
+            sl_oe_n <= 1'b0;                               // word on the bus
+            dtack_drv_r <= 1'b1;
+            sl <= SL_HOLD;
+        end
+        SL_HOLD: begin                                     // until the master ends the cycle
+            if (sp_can) begin                              // keep the stream ahead while the master finishes
+                ps_req_s <= 1'b1; ps_we_s <= 1'b0; ps_two_s <= !sp_last; ps_addr_s <= {sp_next, 1'b0}; ps_be_s <= 2'b11;
+                sp_out <= 1'b1; sp_sel <= !pa_free; sp_a <= sp_next; sp_a1 <= sp_next + 23'd1; sp_two <= !sp_last; sp_dirty <= 1'b0;
+                sp_next <= sp_next + (sp_last ? 23'd1 : 23'd2);
+            end
+            if (!sl_as) begin
+                dtack_drv_r <= 1'b0;
+                sl_oe_n <= 1'b1;
+                sl <= SL_REL1;
+            end
+        end
+        SL_REL1: begin
+            sl_drive <= 1'b0;
+            sl_dir   <= 1'b0;
+            sl <= SL_REL2;
+        end
+        SL_REL2: begin
+            sl_oe_n <= 1'b0;                               // back to input (snoop)
+            sl <= SL_IDLE;
+        end
+        default: sl <= SL_IDLE;
+        endcase
+        // ---- slave-path debug (page 1: live state, 2: AS-in-window / starts, 3: DTACKs / BERRs during our cycle) ----
+        dbg_as_prev   <= sl_as;
+        dbg_berr_prev <= berr_s;
+        dbg_dt_prev   <= dtack_drv_r;
+        if (dbg_clr) begin dbg_ashit <= 4'd0; dbg_start <= 4'd0; dbg_dtack <= 4'd0; dbg_berr <= 4'd0; end
+        else begin
+            if (sl_as && !dbg_as_prev && !own && hit(la_i[23:16])) dbg_ashit <= dbg_ashit + 4'd1;
+            if (sl == SL_IDLE && sl_active && sl_as && sl_ds && hit(la_i[23:16])) dbg_start <= dbg_start + 4'd1;
+            if (dtack_drv_r && !dbg_dt_prev) dbg_dtack <= dbg_dtack + 4'd1;
+            if (berr_s && !dbg_berr_prev && sl != SL_IDLE) dbg_berr <= dbg_berr + 4'd1;
+        end
+        if (dtack_drv_r && !dbg_dt_prev) dbg_hold <= 10'd0;
+        else if (dtack_drv_r && dbg_hold != 10'h3FF) dbg_hold <= dbg_hold + 10'd1;
+        if (dtack_drv_r && !sl_as) dbg_hold_q <= dbg_hold[9:2];   // AS negated while we hold DTACK: latch /4 (255 = >= 16 us)
+        case (dbg_sel)
+        2'd1: dbg_byte <= {ps_fst, st};                   // live: controller frame state, engine state
+        2'd2: dbg_byte <= {dbg_wbe, dbg_waddr};          // last slave write: byte enables + A6..A1
+        2'd3: dbg_byte <= dbg_wdata;                     // last slave write: data bits 7:0
+        default: dbg_byte <= 8'h00;
+        endcase
+        if (ps_req_s && ps_we_s) begin dbg_wbe <= ps_be_s; dbg_waddr <= ps_addr_s[6:1]; dbg_wdata <= ps_wdata_s[7:0]; end
+        if (own && sl != SL_IDLE) begin                    // we took the bus back: reset the slave path
+            sl <= SL_IDLE; dtack_drv_r <= 1'b0; sl_oe_n <= 1'b0; sl_drive <= 1'b0; sl_dir <= 1'b0;
+        end
+    end
+
     always @(posedge clk) begin
         cmd_pop <= 1'b0;
         snoop_push <= 1'b0;
+        ps_req_m <= 1'b0;
 
         if (flags_clr) begin
             berr_flag <= 1'b0;
@@ -387,7 +648,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
         if (adv) case (st)
         ST_IDLE: begin
             as_n_o <= 1'b1; uds_n_o <= 1'b1; lds_n_o <= 1'b1; rw_o <= 1'b1;
-            ld_drive <= 1'b0;
+            ld_drive_m <= 1'b0;
             own  <= 1'b1;
             bg_n <= 1'b1;
             vma_req <= 1'b0;
@@ -397,13 +658,41 @@ module bus_engine #(parameter SNOOP_AW = 9) (
             // while the snoop FIFO drains); then the commands posted while
             // the request was pending (see the FIFO).  Speculative fetches
             // come last.
-            if (br_s && !snoop_afull && (!cmd_rdy || c_abr)) begin
+            if (passive) begin
+                pf_run <= 1'b0;          // hand the bus to the real CPU (same turnaround as a grant)
+                pf_wp  <= 4'd0; pf_rp <= 4'd0;
+                a_oe_n <= 1'b1;
+                own    <= 1'b0;
+                st <= ST_GISO;
+            end else if (br_s && !snoop_afull && (!cmd_rdy || c_abr)) begin
                 pf_run <= 1'b0;          // another master: stop fetching (keep the words)
                 bg_n   <= 1'b0;
                 a_oe_n <= 1'b1;          // isolate before turnaround
                 own    <= 1'b0;
                 wdog   <= 12'd0;
                 st <= ST_GISO;
+            end else if (cmd_rdy && hit(c_addr[23:16]) && !ps_busy) begin
+                // the Pi's command lands in the PSRAM window: serve it internally
+                p_a0    <= c_a0;
+                p_rw    <= c_rw;
+                p_word  <= c_word;
+                p_pf    <= c_pf && c_rw;
+                p_spec  <= 1'b0;
+                la_o    <= c_addr;       // (pf bookkeeping in ST_PS uses la_o/fc_o like ST_END)
+                fc_o    <= c_fc;
+                ps_req_m   <= 1'b1;
+                ps_we_m    <= !c_rw;
+                ps_addr_m  <= {c_addr, 1'b0};      // even address; the controller selects the byte from ps_be
+                ps_wdata_m <= c_word ? c_wdata : {c_wdata[7:0], c_wdata[7:0]};
+                ps_be_m    <= c_word ? 2'b11 : (c_a0 ? 2'b01 : 2'b10);
+                cmd_pop <= 1'b1;
+                vpa_flag <= 1'b0;
+                pf_run <= 1'b0;
+                pf_wp  <= 4'd0;
+                pf_rp  <= 4'd0;
+                st <= ST_PS; ps_wd <= 12'd0;
+            end else if (cmd_rdy && hit(c_addr[23:16])) begin
+                // PSRAM frame still running (a slave access just ended): wait
             end else if (cmd_rdy) begin
                 la_o    <= c_addr;
                 p_a0    <= c_a0;
@@ -429,6 +718,20 @@ module bus_engine #(parameter SNOOP_AW = 9) (
                 end
             end else if (br_s) begin
                 pf_run <= 1'b0;          // request pending, snoop FIFO full: wait
+            end else if (pf_run && pf_cnt != 4'd8 && hit(pf_a[23:16])) begin
+                if (!ps_busy) begin      // speculative word from the PSRAM
+                    la_o    <= pf_a;
+                    p_a0    <= 1'b0;
+                    p_rw    <= 1'b1;
+                    p_word  <= 1'b1;
+                    p_pf    <= 1'b0;
+                    p_spec  <= 1'b1;
+                    ps_req_m  <= 1'b1;
+                    ps_we_m   <= 1'b0;
+                    ps_addr_m <= {pf_a, 1'b0};
+                    ps_be_m   <= 2'b11;
+                    st <= ST_PS; ps_wd <= 12'd0;
+                end
             end else if (pf_run && pf_cnt != 4'd8) begin
                 la_o    <= pf_a;         // speculative word read, same FC as the command
                 p_a0    <= 1'b0;
@@ -444,11 +747,55 @@ module bus_engine #(parameter SNOOP_AW = 9) (
             end
         end
 
+        ST_PS: begin                     // PSRAM access (clk rate); no bus activity
+            ps_wd <= ps_wd + 12'd1;
+            if (&ps_wd) begin            // no ack in ~64 us: the request was lost - fail the command, do not hang the Pi
+                timeout_flag <= 1'b1;
+                pf_run <= 1'b0;
+                st <= passive ? ST_PASSIVE : ST_IDLE;
+            end else if (ps_ack) begin
+                if (p_pf || p_spec) begin
+                    pf_q[pf_wp[2:0]] <= ps_rdata;
+                    pf_wp <= pf_wp + 4'd1;
+                    pf_run <= !(&la_o[15:1]) && (p_pf || pf_run);
+                    pf_a   <= la_o + 23'd1;
+                    if (p_pf) pf_fc <= fc_o;
+                end else if (p_rw)
+                    rdata <= p_word ? ps_rdata : (p_a0 ? {8'h00, ps_rdata[7:0]} : {8'h00, ps_rdata[15:8]});
+                st <= passive ? ST_PASSIVE : ST_IDLE;
+            end
+        end
+
+        ST_PASSIVE: begin                // a real CPU runs; we snoop and (slave path) serve the window
+            own  <= 1'b0;
+            bg_n <= 1'b1;
+            if (!passive) begin
+                a_oe_n <= 1'b1;
+                st <= ST_UNGISO;
+            end else if (cmd_rdy && hit(c_addr[23:16]) && !ps_busy && sl == SL_IDLE) begin
+                p_a0 <= c_a0; p_rw <= c_rw; p_word <= c_word; p_pf <= 1'b0; p_spec <= 1'b0;
+                ps_req_m   <= 1'b1;
+                ps_we_m    <= !c_rw;
+                ps_addr_m  <= {c_addr, 1'b0};      // even address; the controller selects the byte from ps_be
+                ps_wdata_m <= c_word ? c_wdata : {c_wdata[7:0], c_wdata[7:0]};
+                ps_be_m    <= c_word ? 2'b11 : (c_a0 ? 2'b01 : 2'b10);
+                cmd_pop  <= 1'b1;
+                st <= ST_PS; ps_wd <= 12'd0;
+            end else if (cmd_rdy && !hit(c_addr[23:16])) begin
+                cmd_pop <= 1'b1;         // no bus for the Pi in this mode: fail the command
+                timeout_flag <= 1'b1;
+                if (c_rw) rdata <= 16'hFFFF;
+            end
+        end
+
         ST_WSETUP: begin                 // buffer is off: flip and drive
-            ld_o     <= p_word ? p_wdata : {p_wdata[7:0], p_wdata[7:0]};
+            ld_o_m   <= p_word ? p_wdata : {p_wdata[7:0], p_wdata[7:0]};
             d_dir    <= 1'b1;
-            ld_drive <= 1'b1;
-            st <= slow ? ST_WEN : ST_ADDR1;
+            ld_drive_m <= 1'b1;
+            // wr_setup ticks of data before AS apply to the 4-clock cycle too: without them the
+            // 16 MHz main RAM lost about 1 word in 10000 (bits dropped; X68000-side WRTEST,
+            // docs 55) - the 0.1.13 margin had only survived on the slow (5-clock) path.
+            st <= (slow || wr_setup != 2'd0) ? ST_WEN : ST_ADDR1;
         end
 
         ST_WEN: begin
@@ -535,7 +882,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
 
         ST_END3: begin                   // release the data bus, buffer back to input
             d_oe_n   <= 1'b1;
-            ld_drive <= 1'b0;
+            ld_drive_m <= 1'b0;
             d_dir    <= 1'b0;
             st <= ST_IDLE;
         end
@@ -543,7 +890,11 @@ module bus_engine #(parameter SNOOP_AW = 9) (
         // ---- bus grant + snoop ----
         ST_GISO: begin                       // pins are Z, A buffer is off
             a_dir <= 1'b0;                   // turn around toward snoop
-            st <= ST_GRANT;
+            if (passive) begin
+                a_oe_n <= 1'b0;              // buffer on, input: watch the real CPU
+                st <= ST_PASSIVE;
+            end else
+                st <= ST_GRANT;
         end
 
         ST_GRANT: begin                      // BG# asserted, wait BGACK#

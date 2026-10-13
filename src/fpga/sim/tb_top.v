@@ -12,6 +12,7 @@
 `default_nettype none
 
 module tb_top;
+    integer errors = 0;
 
     // ---------------- clock ----------------
     reg clk16 = 0;
@@ -28,9 +29,16 @@ module tb_top;
     wire buf_d_dir, buf_d_oe_n, buf_a_dir, buf_a_oe_n, buf_o_oe_n;
     wire pi_irq;
     wire led_r, led_g, led_b;
+    // core 2.1: PSRAM + DTACK driver
+    wire [1:0] ps_ce_n;
+    wire ps_sclk;
+    wire [3:0] ps_sio;
+    wire dtack_drv;
 
     // inputs to DUT from bus (through input-fixed buffers, modeled as wires)
     wire b_dtack_n, b_berr_n, b_vpa_n;
+    pullup(b_dtack_n);                 // open-drain: the motherboard and our Q (dtack_drv) pull it low
+    assign b_dtack_n = dtack_drv ? 1'b0 : 1'bz;
     wire b_br_n, b_bgack_n;
     wire b_reset_n, b_halt_n;
     tri1 b_reset_int, b_halt_int;
@@ -73,8 +81,12 @@ module tb_top;
         .buf_a_dir(buf_a_dir), .buf_a_oe_n(buf_a_oe_n), .buf_o_oe_n(buf_o_oe_n),
         .pi_ad(pi_ad), .pi_reg_a(pi_reg_a), .pi_wr_n(pi_wr_n), .pi_rd_n(pi_rd_n),
         .pi_irq(pi_irq),
-        .led_r(led_r), .led_g(led_g), .led_b(led_b)
+        .led_r(led_r), .led_g(led_g), .led_b(led_b),
+        .psram_ce_n(ps_ce_n), .psram_sclk(ps_sclk), .psram_sio(ps_sio), .dtack_drv(dtack_drv)
     );
+    defparam dut.u_ps.INIT_WAIT = 400;     // the real wait is ~225 us; keep the sim short
+    psram_model #(.AW(16), .NAME("ps0")) ps0 (.ce_n(ps_ce_n[0]), .sclk(ps_sclk), .sio(ps_sio));
+    psram_model #(.AW(16), .NAME("ps1")) ps1 (.ce_n(ps_ce_n[1]), .sclk(ps_sclk), .sio(ps_sio));
 
     // ---------------- 8T245 transceivers ----------------
     // A = FPGA side, B = bus side. dir=1: A->B.
@@ -115,7 +127,6 @@ module tb_top;
     );
 
     // ---------------- Pi bus tasks ----------------
-    integer errors = 0;
 
     // AS-to-AS spacing monitor (bus cycle length seen by the motherboard)
     reg mon_as = 0;
@@ -219,6 +230,14 @@ module tb_top;
             st = 16'h4000;
             while (st[13:12] == 2'b00 && st[14]) pi_read(2'd3, st);
             if (st[13:12] != 2'b00) pi_read(2'd0, out); else out = 16'hDEAD;
+        end
+    endtask
+
+    // PSRAM window configuration: CTRL writes with fc = 0
+    task ps_config(input [7:0] base, input [7:0] top, input en, input slave, input passive);
+        begin
+            pi_write(2'd2, {1'b0, 3'b000, 3'b000, 1'b1, base});
+            pi_write(2'd2, {1'b0, 3'b000, passive, slave, en, 1'b0, top});
         end
     endtask
 
@@ -773,6 +792,87 @@ module tb_top;
             end
 
 
+
+        // ---------------- 7: PSRAM window (core 2.1) ----------------
+        $display("7a: PSRAM self test + Pi access through the window");
+        wait (dut.u_ps.ready);
+        pi_read(2'd2, da);
+        check("7a present (CTRL bit4)", da & 16'h0010, 16'h0010);
+        ps_config(8'h20, 8'h30, 1, 1, 0);          // 2 MB .. 3 MB, slave on
+        as_n_cyc = 0; mon_as = 1;
+        bus_cycle(0, 1, 24'h200100, 16'h1234, da);
+        bus_cycle(1, 1, 24'h200100, 16'h0000, da); check("7a word", da, 16'h1234);
+        bus_cycle(0, 0, 24'h200101, 16'h00CD, da); // odd byte
+        bus_cycle(0, 0, 24'h200100, 16'h00AB, da); // even byte
+        bus_cycle(1, 1, 24'h200100, 16'h0000, da); check("7a bytes", da, 16'hABCD);
+        bus_cycle(1, 0, 24'h200101, 16'h0000, da); check("7a byte rd", da, 16'h00CD);
+        check("7a no bus cycles", as_n_cyc[15:0], 16'h0000);
+        mon_as = 0;
+        // 7b: prefetch stream from the window
+        bus_cycle(0, 1, 24'h200200, 16'h1111, da);
+        bus_cycle(0, 1, 24'h200202, 16'h2222, da);
+        bus_cycle(0, 1, 24'h200204, 16'h3333, da);
+        pf_read(24'h200200, da); check("7b pf0", da, 16'h1111);
+        pf_next(da); check("7b pf1", da, 16'h2222);
+        pf_next(da); check("7b pf2", da, 16'h3333);
+        // 7c: a DMA burst writes into the window: served with DTACK, stored, snooped
+        pi_read(2'd3, st);                         // drain records left by the earlier tests
+        while (st[2]) begin pi_read(2'd1, da); pi_read(2'd3, st); end
+        pi_write(2'd3, 16'h20C0);                  // phase reset
+        pi_write(2'd3, 16'h2040);
+        mobo.dma_burst(24'h200300, 16'h5A00, 3);
+        #2000;
+        bus_cycle(1, 1, 24'h200300, 16'h0000, da); check("7c dma w0", da, 16'h5A00);
+        bus_cycle(1, 1, 24'h200304, 16'h0000, da); check("7c dma w2", da, 16'h5A02);
+        pi_read(2'd3, st); check("7c snoop avail", st & 16'h0004, 16'h0004);
+        pi_read(2'd1, hi); pi_read(2'd1, lo); pi_read(2'd1, da);
+        check("7c snoop lo", lo, 16'h0300);
+        check("7c snoop data", da, 16'h5A00);
+        pi_write(2'd3, 16'h20C0);                  // snoop reset (clear the rest)
+        // 7d: a DMA read from the window gets the PSRAM data
+        mobo.dma_read(24'h200300, 3);
+        check("7d dma r0", mobo.dma_rd[0], 16'h5A00);
+        check("7d dma r1", mobo.dma_rd[1], 16'h5A01);
+        check("7d dma r2", mobo.dma_rd[2], 16'h5A02);
+        // 7e: slave off: the window no longer answers other masters
+        ps_config(8'h20, 8'h30, 1, 0, 0);
+        begin : t7e
+            integer done;
+            mobo.dma_burst_to(24'h200400, 16'h7700, 1, 3000, done);
+            check("7e no DTACK", done[15:0], 16'h0000);
+        end
+        bus_cycle(1, 1, 24'h200400, 16'h0000, da); check("7e untouched", da, 16'h0000);
+        ps_config(8'h20, 8'h30, 0, 0, 0);          // window off again
+        // 7f: passive mode (riser 2.0): we stop driving, a CPU on the bus uses the window
+        $display("7f: passive mode");
+        ps_config(8'h20, 8'h30, 1, 1, 1);
+        #3000;
+        check("7f A buffer input", {15'd0, buf_a_dir}, 16'h0000);
+        check("7f ctrl outputs off", {15'd0, buf_o_oe_n}, 16'h0001);
+        mobo.cpu_write(24'h200500, 16'h4242);
+        mobo.cpu_read(24'h200500, da); check("7f cpu rd", da, 16'h4242);
+        bus_cycle(1, 1, 24'h200500, 16'h0000, da); check("7f pi rd (internal)", da, 16'h4242);
+        pi_write(2'd3, 16'h2044);                  // clear the fault flags
+        bus_cycle(1, 1, 24'h000100, 16'h0000, da); // outside the window: refused with a timeout flag
+        pi_read(2'd3, st); check("7f pi outside -> fault", st & 16'h0002, 16'h0002);
+        pi_write(2'd3, 16'h2044);
+        ps_config(8'h20, 8'h30, 1, 1, 0);          // back to normal
+        #3000;
+        check("7f back: A buffer output", {15'd0, buf_a_dir}, 16'h0001);
+        bus_cycle(1, 1, 24'h000100, 16'h0000, da); // a bus cycle works again
+        pi_read(2'd3, st); check("7f back: no fault", st & 16'h0002, 16'h0000);
+        ps_config(8'h20, 8'h30, 0, 0, 0);
+        // 7g: DTACK driver self test (rw = 1 word bit 9): the driver is held on
+        // while the engine is idle and CTRL bit 4 shows the DTACK input
+        $display("7g: DTACK driver self test");
+        pi_write(2'd2, {1'b0, 3'b000, 2'b00, 1'b1, 1'b1, 8'h20});
+        #300;
+        check("7g driver on", {15'd0, dtack_drv}, 16'h0001);
+        pi_read(2'd2, st); check("7g DTACK input low", st & 16'h0010, 16'h0010);
+        pi_write(2'd2, {1'b0, 3'b000, 2'b00, 1'b0, 1'b1, 8'h20});
+        #300;
+        check("7g driver off", {15'd0, dtack_drv}, 16'h0000);
+        pi_read(2'd2, st); check("7g bit4 = present again", st & 16'h0010, 16'h0010);
         if (errors == 0) $display("ALL TESTS PASSED");
         else $display("%0d TEST(S) FAILED", errors);
         $finish;
@@ -841,7 +941,7 @@ module x68k_model (
             dt <= {dt[0], 1'b1};
         else
             dt <= 2'b00;
-    assign dtack_n = dt[1] ? 1'b0 : 1'b1;
+    assign dtack_n = dt[1] ? 1'b0 : 1'bz;   // open-drain (pull-up in the testbench)
 
     // vectored IACK data
     assign ld[7:0] = (iack_vec && !lds_n) ? 8'h40 : 8'bz;
@@ -888,6 +988,84 @@ module x68k_model (
     assign lds_n = d_drv ? d_lds : 1'bz;
     assign rw   = d_drv ? d_rw : 1'bz;
     assign fc   = d_drv ? 3'b101 : 3'bz;   // DMAC drives FC during its cycles
+
+    reg [15:0] dma_rd [0:15];
+    // read `count` words from `base` as the bus master; results in dma_rd[]
+    task dma_read(input [23:0] base, input integer count);
+        integer k;
+        begin
+            drq = 1;
+            wait (bg_n === 1'b0);
+            @(posedge clk);
+            dack = 1; drq = 0;
+            #200;
+            d_drv = 1;
+            for (k = 0; k < count; k = k + 1) begin
+                d_la = base[23:1] + k[22:0];
+                d_rw = 1;
+                @(posedge clk); d_as = 0; d_uds = 0; d_lds = 0;
+                wait (dtack_n === 1'b0);
+                @(posedge clk); @(posedge clk);
+                dma_rd[k] = ld;
+                d_as = 1; d_uds = 1; d_lds = 1;
+                @(posedge clk);
+            end
+            d_drv = 0; d_rw = 1;
+            #100 dack = 0;
+        end
+    endtask
+
+    // like dma_burst but gives up on a cycle that gets no DTACK within `limit` ns
+    task dma_burst_to(input [23:0] base, input [15:0] d0, input integer count, input integer limit, output integer done);
+        integer k; time t0;
+        begin
+            done = 0;
+            drq = 1;
+            wait (bg_n === 1'b0);
+            @(posedge clk);
+            dack = 1; drq = 0;
+            #200;
+            d_drv = 1;
+            for (k = 0; k < count; k = k + 1) begin
+                d_la = base[23:1] + k[22:0];
+                d_rw = 0;
+                @(posedge clk); d_as = 0;
+                @(posedge clk); d_uds = 0; d_lds = 0; d_ld = d0 + k[15:0];
+                t0 = $time;
+                while (dtack_n !== 1'b0 && $time - t0 < limit) @(posedge clk);
+                if (dtack_n === 1'b0) done = done + 1;
+                @(posedge clk);
+                d_as = 1; d_uds = 1; d_lds = 1;
+                @(posedge clk);
+            end
+            d_drv = 0; d_rw = 1;
+            #100 dack = 0;
+        end
+    endtask
+
+    // a CPU-like master that owns the bus without arbitration (riser 2.0 passive mode)
+    task cpu_write(input [23:0] a, input [15:0] d);
+        begin
+            d_drv = 1; d_la = a[23:1]; d_rw = 0;
+            @(posedge clk); d_as = 0;
+            @(posedge clk); d_uds = 0; d_lds = 0; d_ld = d;
+            wait (dtack_n === 1'b0);
+            @(posedge clk);
+            d_as = 1; d_uds = 1; d_lds = 1;
+            @(posedge clk); d_drv = 0; d_rw = 1;
+        end
+    endtask
+    task cpu_read(input [23:0] a, output [15:0] out);
+        begin
+            d_drv = 1; d_la = a[23:1]; d_rw = 1;
+            @(posedge clk); d_as = 0; d_uds = 0; d_lds = 0;
+            wait (dtack_n === 1'b0);
+            @(posedge clk); @(posedge clk);
+            out = ld;
+            d_as = 1; d_uds = 1; d_lds = 1;
+            @(posedge clk); d_drv = 0;
+        end
+    endtask
 
     task dma_burst(input [23:0] base, input [15:0] d0, input integer count);
         integer k;

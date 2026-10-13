@@ -9,7 +9,7 @@ WITH_EMU ?= 1
 
 OBJS = main.o kernel.o webserver.o discovery.o config.o hw_port_circle.o hw.o vmpu68_io.o
 ifeq ($(WITH_EMU),1)
-OBJS += libc_stubs.o emu68k.o jit_a64.o m68kcpu.o m68kops.o softfloat.o
+OBJS += libc_stubs.o emu68k.o jit_a64.o m68kcpu.o m68kops.o softfloat.o vscsi.o sdimg.o netfetch.o lanlabel.o human68k.o iso9660.o imgfs.o
 endif
 
 LIBS = $(CIRCLEHOME)/addon/wlan/hostap/wpa_supplicant/libwpa_supplicant.a \

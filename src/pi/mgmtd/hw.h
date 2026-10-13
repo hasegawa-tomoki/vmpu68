@@ -47,6 +47,12 @@ int  hw_drv_state(void);
 void hw_set_autostart(int on);             /* 1 = 2-write bus cycles (faster, DRAM-margin sensitive) */
 int  hw_set_busy_irq(int on);              /* completion on PI_IRQ (returns the effective mode) */
 int  hw_busy_irq(void);
+void hw_psram_cfg(unsigned base_blk, unsigned top_blk, int en, int slave, int passive);   /* core 2.1 PSRAM window; kept across FPGA re-init */
+void hw_psram_get(unsigned *base_blk, unsigned *top_blk, int *en, int *slave, int *passive);
+int  hw_psram_present(void);        /* the bitstream's PSRAM self test passed (0 in mock) */
+unsigned hw_slave_dbg(unsigned page, int clr);   /* slave-path debug byte (bitstream >= 1.1 test builds); page 0 restores the normal CTRL low byte */
+int  hw_dtack_test(int on);
+extern volatile int hw_phase; extern volatile uint32_t hw_phase_addr;   /* stall sampler */         /* core 2.1 DTACK driver self test: on=1 holds DTACK low while the engine is idle and returns the DTACK input (1 = low seen, 0 = still high); on=0 releases; -1 in mock */
 int  hw_set_smi(int on);           /* SMI transport for the register bus (core 2.x): 0 ok, -1 unavailable, -2 the FPGA did not answer (reverted) */
 int  hw_smi(void);
 int  hw_set_wr_ai(int on);         /* ai write mode: 1 strobe per sequential write (needs the bitstream) */
@@ -99,6 +105,10 @@ extern uint32_t hw_iack_prefault;             /* IACKs that found the sticky fau
 typedef struct { uint32_t addr; uint16_t data; uint8_t kind, st; } hw_op_t;
 extern hw_op_t  hw_ops[HW_OPS];
 extern unsigned hw_op_n;
+#define HW_OPS_SNAP 16
+extern hw_op_t  hw_ops_snap[HW_OPS_SNAP];   /* the ops before the emulator's last bus fault (hw_ops_snapshot) */
+extern unsigned hw_ops_snap_n;
+void hw_ops_snapshot(void);
 
 /* flash: JEDEC id, full-image program with verify */
 int hw_flash_id(uint8_t id[3]);

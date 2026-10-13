@@ -251,6 +251,46 @@ int hw_set_smi(int on)
 }
 int hw_smi(void) { return mock ? 0 : vmpu68_smi_io(); }
 
+/* PSRAM window: shadowed so that hw_reinit() (FPGA reloaded) restores it */
+static unsigned ps_base, ps_top; static int ps_en, ps_slave, ps_passive;
+void hw_psram_cfg(unsigned base_blk, unsigned top_blk, int en, int slave, int passive)
+{
+    ps_base = base_blk & 0xFF; ps_top = top_blk & 0xFF; ps_en = en ? 1 : 0; ps_slave = slave ? 1 : 0; ps_passive = passive ? 1 : 0;
+    if (mock) return;
+    HWLOCK();
+    vmpu68_psram_cfg(ps_base, ps_top, ps_en, ps_slave, ps_passive);
+    HWUNLOCK();
+}
+void hw_psram_get(unsigned *base_blk, unsigned *top_blk, int *en, int *slave, int *passive)
+{
+    if (base_blk) *base_blk = ps_base; if (top_blk) *top_blk = ps_top;
+    if (en) *en = ps_en; if (slave) *slave = ps_slave; if (passive) *passive = ps_passive;
+}
+int hw_psram_present(void)
+{
+    if (mock) return 0;
+    int r;
+    HWLOCK(); r = vmpu68_psram_present(); HWUNLOCK();
+    return r;
+}
+unsigned hw_slave_dbg(unsigned page, int clr)
+{
+    if (mock) return 0;
+    unsigned r;
+    HWLOCK(); r = vmpu68_slave_dbg(ps_base, page, clr); HWUNLOCK();
+    return r;
+}
+int hw_dtack_test(int on)
+{
+    if (mock) return -1;
+    int r = 0;
+    HWLOCK();
+    vmpu68_dtack_test(ps_base, on);
+    if (on) { (void) vmpu68_reg_read(VREG_CTRL); r = vmpu68_psram_present(); }   /* one read as settling time, then bit 4 = DTACK input (low = 1) */
+    HWUNLOCK();
+    return r;
+}
+
 /* snoop stream v2 (REG3 bit13, echoed at VDIAG_SNOOP2).  Older bitstreams
  * have the idle WR# level, 1, in that bit: the probe writes the bit as 0
  * first and only trusts an echo that follows the write both ways. */
@@ -366,6 +406,7 @@ void hw_reinit(void)
     hw_set_snoop2_u(1);
     vmpu68_reg_write(VREG_STATUS, (uint16_t)(ctrl_shadow | VSTW_SNOOP_RST | VSTW_FLAG_CLR));
     vmpu68_snoop_resync();
+    if (ps_en || ps_passive) vmpu68_psram_cfg(ps_base, ps_top, ps_en, ps_slave, ps_passive);   /* the window is in the reloaded FPGA's registers */
     HWUNLOCK();
 }
 
@@ -664,6 +705,13 @@ static int hw_flash_program_u(const uint8_t *img, size_t len, char *err, size_t 
 /* ---------------- locked public wrappers ---------------- */
 /* diagnostics: the last HW_OPS bus operations of all cores, in lock order */
 hw_op_t  hw_ops[HW_OPS];
+hw_op_t  hw_ops_snap[HW_OPS_SNAP]; unsigned hw_ops_snap_n;
+void hw_ops_snapshot(void)
+{
+    unsigned n = hw_op_n < HW_OPS_SNAP ? hw_op_n : HW_OPS_SNAP;
+    for (unsigned i = 0; i < n; i++) hw_ops_snap[i] = hw_ops[(hw_op_n - n + i) & (HW_OPS - 1)];
+    hw_ops_snap_n = n;
+}
 unsigned hw_op_n;
 static inline void op_log(uint32_t a, int w, unsigned kind, uint16_t d, uint16_t st)
 {
@@ -672,7 +720,8 @@ static inline void op_log(uint32_t a, int w, unsigned kind, uint16_t d, uint16_t
 }
 uint16_t hw_reg_read(unsigned reg) { HWLOCK(); uint16_t r = hw_reg_read_u(reg); HWUNLOCK(); return r; }
 uint16_t hw_status(void)           { uint16_t r; HWLOCK(); PROF(status, r = hw_status_u()); HWUNLOCK(); return r; }   /* IPL/snoop sampling: independent of queued writes */
-uint16_t hw_bus_read(uint32_t a, int w, uint16_t *o)  { uint16_t r; wq_sync_reads(a); HWLOCK(); PROF(rd, r = hw_bus_read_u(a, w, o));  op_log(a, w, 0, *o, r); HWUNLOCK(); return r; }
+volatile int hw_phase = 0; volatile uint32_t hw_phase_addr = 0;   /* where hw_bus_read is (stall sampler): 1 wq sync, 2 lock wait, 3 reading */
+uint16_t hw_bus_read(uint32_t a, int w, uint16_t *o)  { uint16_t r; hw_phase_addr = a; hw_phase = 1; wq_sync_reads(a); hw_phase = 2; HWLOCK(); hw_phase = 3; PROF(rd, r = hw_bus_read_u(a, w, o));  op_log(a, w, 0, *o, r); HWUNLOCK(); hw_phase = 0; return r; }
 uint16_t hw_bus_write(uint32_t a, int w, uint16_t d)
 {
     if (wq_on && on_producer_core()) {

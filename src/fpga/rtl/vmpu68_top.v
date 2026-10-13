@@ -53,7 +53,13 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     // ---- misc ----
     output wire        led_r,
     output wire        led_g,
-    output wire        led_b
+    output wire        led_b,
+
+    // ---- core 2.1: QPI PSRAM (2 x VTI7064) and the DTACK driver ----
+    output wire [1:0]  psram_ce_n,
+    output wire        psram_sclk,
+    inout  wire [3:0]  psram_sio,
+    output wire        dtack_drv       // open-drain MOSFET pulling DTACK low (bus slave)
 );
 
     // ------------------------------------------------------------------
@@ -120,6 +126,10 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     wire        drv_reset, drv_halt;
     wire        bus_slow;
     wire [1:0]  wr_setup;
+    wire        ps_en, ps_slave, passive, ps_present, dtack_test, dbg_clr;
+    wire [1:0]  dbg_sel;
+    wire [7:0]  dbg_byte;
+    wire [7:0]  ps_base, ps_top;
 
     pi_if u_pi (
         .clk(clk), .clk16(clk16), .pll_lock(pll_lock), .pi_ad(pi_ad), .pi_reg_a(pi_reg_a),
@@ -134,8 +144,29 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
         .ipl_level(ipl_level), .reset_in(reset_in), .halt_in(halt_in),
         .snoop_avail(snoop_avail), .snoop_rec(snoop_rec), .snoop_pop(snoop_pop),
         .snoop_rst(snoop_rst), .flags_clr(flags_clr),
-        .led(led), .drv_reset(drv_reset), .drv_halt(drv_halt), .bus_slow(bus_slow), .wr_setup(wr_setup)
+        .led(led), .drv_reset(drv_reset), .drv_halt(drv_halt), .bus_slow(bus_slow), .wr_setup(wr_setup),
+        .ps_en(ps_en), .ps_base(ps_base), .ps_top(ps_top), .ps_slave(ps_slave), .passive(passive),
+        .dtack_test(dtack_test), .dbg_sel(dbg_sel), .dbg_clr(dbg_clr), .dbg_byte(dbg_byte),
+        .ps_present(dtack_test ? ~l_dtack_n : ps_present)   // self test: show the DTACK input instead
     );
+
+    // ------------------------------------------------------------------
+    // PSRAM (core 2.1); on earlier boards the pins float and the self test fails
+    // ------------------------------------------------------------------
+    wire        ps_req, ps_we, ps_two, ps_ack, ps_busy, ps_ready;
+    wire [2:0]  ps_fst;
+    wire [23:0] ps_addr;
+    wire [15:0] ps_wdata, ps_rdata, ps_rdata2;
+    wire [1:0]  ps_be;
+    wire [3:0]  sio_o, sio_i;
+    wire        sio_oe;
+    psram_qpi u_ps (
+        .clk(clk), .req(ps_req), .we(ps_we), .two(ps_two), .addr(ps_addr), .wdata(ps_wdata), .be(ps_be),
+        .rdata(ps_rdata), .rdata2(ps_rdata2), .fst_o(ps_fst), .ack(ps_ack), .busy(ps_busy), .ready(ps_ready), .present(ps_present),
+        .ce_n(psram_ce_n), .sclk(psram_sclk), .sio_o(sio_o), .sio_oe(sio_oe), .sio_i(sio_i)
+    );
+    assign psram_sio = sio_oe ? sio_o : 4'bzzzz;
+    assign sio_i     = psram_sio;
 
     // ------------------------------------------------------------------
     // E clock + VMA
@@ -179,7 +210,12 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
         .buf_a_dir(i_buf_a_dir), .buf_a_oe_n(i_buf_a_oe_n),
 
         .snoop_avail(snoop_avail), .snoop_rec(snoop_rec), .snoop_pop(snoop_pop),
-        .snoop_ovf(snoop_ovf), .snoop_rst(snoop_rst)
+        .snoop_ovf(snoop_ovf), .snoop_rst(snoop_rst),
+
+        .ps_en(ps_en), .ps_base(ps_base), .ps_top(ps_top), .ps_slave(ps_slave), .passive(passive),
+        .dtack_test(dtack_test), .dtack_drv(dtack_drv), .dbg_sel(dbg_sel), .dbg_clr(dbg_clr), .dbg_byte(dbg_byte),
+        .ps_req(ps_req), .ps_we(ps_we), .ps_two(ps_two), .ps_addr(ps_addr), .ps_wdata(ps_wdata), .ps_be(ps_be),
+        .ps_rdata(ps_rdata), .ps_rdata2(ps_rdata2), .ps_fst(ps_fst), .ps_ack(ps_ack), .ps_busy(ps_busy)
     );
 
     // ---- tri-state pin drivers (buf_a group follows own) ----
@@ -199,7 +235,7 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     assign buf_d_oe_n = pll_lock ? i_buf_d_oe_n : 1'b1;
     assign buf_a_dir  = i_buf_a_dir;
     assign buf_a_oe_n = pll_lock ? i_buf_a_oe_n : 1'b1;
-    assign buf_o_oe_n = pll_lock ? 1'b0 : 1'b1;
+    assign buf_o_oe_n = (pll_lock && !passive) ? 1'b0 : 1'b1;   // passive (riser 2.0): a real CPU drives E/BG
 
     assign rst_drv = drv_reset;
     assign hlt_drv = drv_halt;

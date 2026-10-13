@@ -688,6 +688,9 @@ static inline int on_hook_core(void)
 #endif
     return 1;
 }
+static void (*hang_fn)(uint16_t, uint16_t, unsigned, unsigned, unsigned);
+static unsigned hang_base_blk;             /* the window base last configured (to read the debug pages without moving it) */
+void vmpu68_set_hang_fn(void (*fn)(uint16_t, uint16_t, unsigned, unsigned, unsigned)) { hang_fn = fn; }
 static uint16_t busy_poll(void)
 {
     uint16_t st;
@@ -701,6 +704,12 @@ static uint16_t busy_poll(void)
         if ((st & VST_SNOOP) && hook_ok) snoop_hook();
     }
     poll_hist[n < VMPU68_POLL_HIST ? n : VMPU68_POLL_HIST - 1]++;
+    if (n >= VMPU68_BUSY_POLL_MAX && hang_fn) {       /* gave up: snapshot the FPGA's state for the log */
+        uint16_t ctrl = vmpu68_reg_read(VREG_CTRL);
+        unsigned d1 = vmpu68_slave_dbg(hang_base_blk, 1, 0), d2 = vmpu68_slave_dbg(hang_base_blk, 2, 0), d3 = vmpu68_slave_dbg(hang_base_blk, 3, 0);
+        vmpu68_slave_dbg(hang_base_blk, 0, 0);
+        hang_fn(st, ctrl, d1, d2, d3);
+    }
     return st;
 }
 
@@ -961,6 +970,12 @@ restart:
     do { st = vmpu68_reg_read(VREG_STATUS); n++; }
     while ((st & VST_BUSY) && n < VMPU68_BUSY_POLL_MAX);
     poll_hist[n < VMPU68_POLL_HIST ? n : VMPU68_POLL_HIST - 1]++;
+    if (n >= VMPU68_BUSY_POLL_MAX && hang_fn) {       /* gave up (pf path): snapshot the FPGA's state for the log */
+        uint16_t ctrl = vmpu68_reg_read(VREG_CTRL);
+        unsigned d1 = vmpu68_slave_dbg(hang_base_blk, 1, 0), d2 = vmpu68_slave_dbg(hang_base_blk, 2, 0), d3 = vmpu68_slave_dbg(hang_base_blk, 3, 0);
+        vmpu68_slave_dbg(hang_base_blk, 0, 0);
+        hang_fn(st, ctrl, d1 | 0x100, d2, d3);      /* d1 bit 8: the pf path */
+    }
     if (!VST_PF_CNT(st)) { *out = 0xFFFF; return st; }
     *out = vmpu68_reg_read(VREG_DATA);
     pf_have = VST_PF_CNT(st) - 1;
@@ -1065,6 +1080,32 @@ int vmpu68_snoop_pop(vmpu68_snoop_t *rec)
     rec->addr = addr & 0xFFFFFF;
     rec->data = da;
     return 1;
+}
+
+/* ---------------- PSRAM window (core 2.1) ---------------- */
+void vmpu68_psram_cfg(unsigned base_blk, unsigned top_blk, int en, int slave, int passive)
+{
+    hang_base_blk = base_blk & 0xFF;
+    vmpu68_reg_write(VREG_CTRL, (uint16_t)(0x0100u | (base_blk & 0xFF)));            /* fc=0, rw=1: base */
+    vmpu68_reg_write(VREG_CTRL, (uint16_t)((passive ? 0x0800u : 0) | (slave ? 0x0400u : 0) |
+                                           (en ? 0x0200u : 0) | (top_blk & 0xFF)));  /* fc=0, rw=0: top + flags */
+    vmpu68_ctrl_invalidate();
+}
+int vmpu68_psram_present(void)
+{
+    return (vmpu68_reg_read(VREG_CTRL) & VDIAG_PSRAM) ? 1 : 0;
+}
+unsigned vmpu68_slave_dbg(unsigned base_blk, unsigned page, int clr)
+{
+    vmpu68_reg_write(VREG_CTRL, (uint16_t)(0x0100u | ((page & 3) << 10) | (clr ? 0x1000u : 0) | (base_blk & 0xFF)));
+    vmpu68_ctrl_invalidate();
+    (void) vmpu68_reg_read(VREG_CTRL);
+    return vmpu68_reg_read(VREG_CTRL) & 0xFF;
+}
+void vmpu68_dtack_test(unsigned base_blk, int on)
+{
+    vmpu68_reg_write(VREG_CTRL, (uint16_t)(0x0100u | (on ? 0x0200u : 0) | (base_blk & 0xFF)));   /* fc=0, rw=1: base + DTACK driver test */
+    vmpu68_ctrl_invalidate();
 }
 
 /* ---------------- bit-banged SPI flash (W25Q32) ---------------- */
