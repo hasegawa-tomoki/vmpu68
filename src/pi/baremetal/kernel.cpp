@@ -2411,6 +2411,32 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         int r = was ? hw_set_smi (1) : 0;
         R.Format ("smi flags %u: %s\r\n", vmpu68_smi_get_flags (), r == 0 ? (was ? "on, FPGA answers" : "set (SMI off)") : "the FPGA did not answer - back to GPIO");
     }
+    else if (p[0] == 'f' && p[1] == 'i' && p[2] == 'l' && p[3] == 'l')   // fill <addr> <words> <seed>: write WRTEST's pattern (word i = i*$9E37 + seed*$1111 + $2468) from the Pi
+    {
+        p += 4;
+        unsigned a = parse_num (p) & 0xFFFFFE, n = parse_num (p), seed = parse_num (p);
+        unsigned faults = 0;
+        for (unsigned i = 0; i < n; i++)
+        {
+            uint16_t v = (uint16_t) (i * 0x9E37u + seed * 0x1111u + 0x2468u);
+            if (hw_bus_write (a + 2 * i, 1, v) & VST_FAULT) { faults++; hw_clear_fault (); }
+        }
+        hw_wq_sync ();
+        R.Format ("fill %06X x%u seed %u: faults=%u\r\n", a, n, seed, faults);
+    }
+    else if (p[0] == 'c' && p[1] == 'h' && p[2] == 'k' && p[3] == ' ')   // chk <addr> <words> <seed> [pf]: read back and count words != WRTEST's pattern (first mismatch shown)
+    {
+        p += 4;
+        unsigned a = parse_num (p) & 0xFFFFFE, n = parse_num (p), seed = parse_num (p);
+        unsigned bad = 0, faults = 0, first = ~0u; uint16_t got0 = 0, want0 = 0;
+        for (unsigned i = 0; i < n; i++)
+        {
+            uint16_t v = 0, want = (uint16_t) (i * 0x9E37u + seed * 0x1111u + 0x2468u);
+            if (hw_bus_read (a + 2 * i, 1, &v) & VST_FAULT) { faults++; hw_clear_fault (); }
+            if (v != want) { bad++; if (first == ~0u) { first = a + 2 * i; got0 = v; want0 = want; } }
+        }
+        R.Format ("chk %06X x%u seed %u: bad=%u faults=%u first@%06X got %04X want %04X\r\n", a, n, seed, bad, faults, first, got0, want0);
+    }
     else if (p[0] == 'b' && p[1] == 'o' && p[2] == 'p' && p[3] == 's')   // bops [n]: the last n bus operations of the Pi side (oldest first; r/w read/write, W queued write, i IACK; b/w byte/word)
     {
         p += 4;

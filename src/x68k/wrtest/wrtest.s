@@ -31,13 +31,18 @@ V_A0            equ     36
 V_A1            equ     40
 V_SP            equ     44
 V_MBLK          equ     48
-V_SIZE          equ     52
+V_MODE          equ     52
+V_SEED          equ     56
+V_WORDS         equ     60
+V_SIZE          equ     64
 
                 bra.w   start
                 dc.b    'WRTEST 1.0',0
                 even
 start:
                 lea     vars(pc),a5
+                clr.l   V_MODE(a5)
+                clr.w   V_SEED(a5)
                 move.l  a0,V_A0(a5)
                 move.l  a1,V_A1(a5)
                 move.l  sp,V_SP(a5)
@@ -51,8 +56,25 @@ start:
                 cmp.b   #'c',d1
                 beq.s   .cs
                 cmp.b   #'C',d1
-                bne.s   .arg
+                beq.s   .cs
+                cmp.b   #'v',d1
+                beq.s   .vmode
+                cmp.b   #'w',d1
+                beq.s   .wmode
+                bra.s   .arg
 .cs:            move.l  #1,V_CS(a5)     ; 'c': サイクルスチール転送
+                bra.s   .arg
+.vmode:         move.l  #1,V_MODE(a5)   ; 'v <seed>': VRAM → dst(Pi が fill で書いた VRAM を X68000 側で読む)
+                bra.s   .seed
+.wmode:         move.l  #2,V_MODE(a5)   ; 'w <seed>': src → VRAM(X68000 側が書き、Pi が chk で読む)
+.seed:          move.b  (a2)+,d1        ; 種(1 桁の数字)
+                subq.b  #1,d0
+                cmp.b   #' ',d1
+                beq.s   .seed
+                sub.b   #'0',d1
+                and.w   #15,d1
+                move.w  d1,V_SEED(a5)
+                bra.s   .arg
 .noarg:
                 ; バッファは _MALLOC で確保する(Human68k はこのプログラムに自分のサイズ分しか割り当てない。
                 ; ブロック末尾から下へ取ると COMMAND.X など他の領域を DMA で壊す)
@@ -102,10 +124,13 @@ start:
                 lea     msg_hdr3(pc),a0
                 bsr     print
 
+                tst.l   V_MODE(a5)
+                bne     vram_mode
                 moveq   #1,d7
 round_loop:
                 move.l  V_SRC(a5),a0
                 move.w  d7,d6
+                move.l  #WORDS,V_WORDS(a5)
                 bsr     fill            ; 先(dst)は CPU で触らない: ダーティにするとスヌープ取りこぼしの補修が飛び、偽の化けになる
                 bsr     dma_copy
                 move.l  V_DST(a5),a0
@@ -134,7 +159,42 @@ err_malloc:     lea     msg_emalloc(pc),a0
                 bsr     print
                 dc.w    $FF00
 
-; ---- DMAC ch2: V_SRC → V_DST、WORDS ワード、バースト、メモリ間(dmat と同じ設定)
+; ---- VRAM 両方向モード(16384 ワード = テキスト VRAM 面 0 の先頭 32 KB)
+VRAM            equ     $E10000         ; テキスト VRAM 面 0 の非表示領域(表示中の行に Human68k が文字を描くため)
+VWORDS          equ     16384
+vram_mode:
+                lea     msg_vmode(pc),a0
+                bsr     print
+                move.w  V_SEED(a5),d6
+                cmp.l   #1,V_MODE(a5)
+                bne.s   .wr
+                ; 'v': VRAM → dst、dst を pattern(seed) と照合
+                move.l  #VRAM,V_SRC(a5)
+                move.l  #VWORDS,V_WORDS(a5)
+                bsr     dma_copy
+                move.l  V_DST(a5),a0
+                move.w  V_SEED(a5),d6
+                bsr     compare_n
+                bra.s   .rep
+.wr:            ; 'w': src に pattern(seed)、src → VRAM
+                move.l  #VWORDS,V_WORDS(a5)
+                move.l  V_SRC(a5),a0
+                move.w  V_SEED(a5),d6
+                bsr     fill_n
+                move.l  #VRAM,V_DST(a5)
+                bsr     dma_copy
+                clr.l   V_MISS(a5)
+                move.l  #-1,V_FIRST(a5)
+.rep:           moveq   #0,d7
+                bsr     report
+                lea     DMAC2,a0
+                move.b  #$FF,0(a0)
+                move.l  V_SSP(a5),-(sp)
+                dc.w    $FF20
+                addq.l  #4,sp
+                dc.w    $FF00
+
+; ---- DMAC ch2: V_SRC → V_DST、V_WORDS ワード、バースト、メモリ間(dmat と同じ設定)
 dma_copy:
                 movem.l d0-d1/a0,-(sp)
                 lea     DMAC2,a0
@@ -147,7 +207,7 @@ dma_copy:
                 move.b  #$10,5(a0)      ; OCR: auto-request limited rate
 .burst:
                 move.b  #$05,6(a0)      ; SCR: MAR++, DAR++
-                move.w  #WORDS,$A(a0)   ; MTC
+                move.w  V_WORDS+2(a5),$A(a0)   ; MTC
                 move.l  V_SRC(a5),$C(a0)        ; MAR
                 move.l  V_DST(a5),$14(a0)       ; DAR
                 move.b  #$05,$29(a0)    ; MFC
@@ -180,6 +240,51 @@ fill:                                   ; a0 = バッファ、d6 = 種
                 cmp.l   #WORDS,d1
                 bcs.s   .l
                 movem.l (sp)+,d0-d2/a0
+                rts
+
+fill_n:                                 ; a0 = バッファ、d6 = 種、V_WORDS ワード
+                movem.l d0-d3/a0,-(sp)
+                move.l  V_WORDS(a5),d3
+                moveq   #0,d1
+.l:             move.w  d1,d2
+                mulu    #$9E37,d2
+                move.w  d6,d0
+                mulu    #$1111,d0
+                add.w   #$2468,d0
+                add.w   d0,d2
+                move.w  d2,(a0)+
+                addq.l  #1,d1
+                cmp.l   d3,d1
+                bcs.s   .l
+                movem.l (sp)+,d0-d3/a0
+                rts
+
+compare_n:                              ; a0 = バッファ、d6 = 種、V_WORDS ワード → V_MISS、V_FIRST、V_GOT、V_WANT
+                movem.l d0-d4/a0,-(sp)
+                clr.l   V_MISS(a5)
+                move.l  #-1,V_FIRST(a5)
+                move.l  V_WORDS(a5),d4
+                moveq   #0,d1
+.l:             move.w  d1,d2
+                mulu    #$9E37,d2
+                move.w  d6,d0
+                mulu    #$1111,d0
+                add.w   #$2468,d0
+                add.w   d0,d2
+                cmp.w   (a0)+,d2
+                beq.s   .ok
+                addq.l  #1,V_MISS(a5)
+                tst.l   V_FIRST(a5)
+                bpl.s   .ok
+                move.l  a0,d3
+                subq.l  #2,d3
+                move.l  d3,V_FIRST(a5)
+                move.w  -2(a0),V_GOT(a5)
+                move.w  d2,V_WANT(a5)
+.ok:            addq.l  #1,d1
+                cmp.l   d4,d1
+                bcs.s   .l
+                movem.l (sp)+,d0-d4/a0
                 rts
 
 compare:                                ; a0 = バッファ、d6 = 種 → V_MISS、V_FIRST
@@ -343,6 +448,7 @@ msg_hdr1:       dc.b    13,10,'  src=$',0
 msg_hdr2:       dc.b    ' dst=$',0
 msg_hdr3:       dc.b    13,10,0
 msg_round:      dc.b    'round ',0
+msg_vmode:      dc.b    'VRAM mode: $E10000 x16384 words (v: VRAM->dst compare, w: src->VRAM)',13,10,0
 msg_bad:        dc.b    ': bad=',0
 msg_first:      dc.b    ' first=$',0
 msg_got:        dc.b    ' got=',0
