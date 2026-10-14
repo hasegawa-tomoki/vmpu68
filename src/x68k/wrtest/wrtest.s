@@ -37,6 +37,7 @@ V_WORDS         equ     60
 V_SIZE          equ     64
 
                 bra.w   start
+                bra.w   start           ; mkx.py の X ヘッダは実行開始番地 0: 先頭は命令でなければならない(識別文字列は偶然無害な命令に化けていた、docs 56.9)
                 dc.b    'WRTEST 1.0',0
                 even
 start:
