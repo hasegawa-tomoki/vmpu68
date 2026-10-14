@@ -66,6 +66,7 @@ static int s_bus_setup_auto = -1;              // wr_setup found by the boot pro
 static int s_bus_slow_pref = 0;                // console 'slow 1': 5-clock bus cycles, kept across every BootX68 (diagnostics)
 static const int kOutDelay10 = 1;              // core 1.0, 4-clock class: bus output delay in internal clocks (docs 56.14: 1 and 3 are clean cold on every board with FB2EB282, 0 loses, 2 breaks)
 static unsigned s_probe_bad[8];                // boot probe: words lost at wr_setup +0..+7 (131072-word samples, both bit directions; +4..+7 need FPGA 1.0.1)
+static unsigned s_probe_badp[4][2];            // the same split into the back-to-back pass and the 1 us-apart pass
 static int s_probe_ok = -1;                    // -1 not probed, 1 a loss-free setting was found, 0 losses at every setting (A/B health)
 static int s_probe_slow = -1;                  // bus cycle type the probe ran with (0 = 4-clock, 1 = 5-clock)
 static const char *probed_str (void);          // " (probed: n)" for bcls
@@ -380,6 +381,8 @@ CKernel::~CKernel (void)
 
 static int  ab_boot_check (void);          // A/B tryboot promote/rollback (defined below)
 static void fpga_version_fixup (void);     // SD:/fpga.sum version from SD:/update.vpk (defined below)
+static int  probe_wr_setup (void);         // boot probe of the write-data setup (defined below; also run by the wsprobe console command)
+const unsigned *vmpu68_bus_probe_lost (void);   // (defined below)
 
 // JIT code buffer: circle maps everything above _etext execute-never (PXN)
 // for EL1, so generated code in the heap takes an instruction abort
@@ -566,7 +569,7 @@ int vmpu68_sramboot_set (int on, boolean save)
 const char *vmpu68_hw_rev (void)
 {
     if (cfg_hw ()[0]) return cfg_hw ();
-    return vmpu68_board_id () == 1 ? "1.0" : "2.0.1";   // the built 2.x boards are 2.0.1; 2.1 (PSRAM) is not detectable yet: hw=2.1 in vmpu68.cfg
+    return vmpu68_board_id () == 1 ? "1.0" : "2.0";     // the built 2.x boards are core 2.0 (the 2.0.1 schematic was never made); 2.1 (PSRAM) is not detectable yet: hw=2.1 in vmpu68.cfg
 }
 
 // Runtime settings (Web UI /api/config, VMPU68.X through the information
@@ -1759,6 +1762,15 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
                           c->min_mhz10 / 10, c->min_mhz10 % 10, c->wr_setup, c->wait_ns, c->io_mhz, c->ai ? "on" : "off");
             R.Append (L);
         }
+    }
+    else if (p[0] == 'w' && p[1] == 's' && p[2] == 'p')    // wsprobe: run the boot-time write-data setup probe again (emulator stopped meanwhile; results in the log and /api/status probe_lost)
+    {
+        emu_quiesce ();
+        int c = probe_wr_setup ();
+        const unsigned *b = vmpu68_bus_probe_lost ();
+        R.Format ("wsprobe: +0 %u (%u/%u), +1 %u (%u/%u), +2 %u (%u/%u), +3 %u (%u/%u) lost per 131072 (back-to-back / 1 us apart) - using +%d\r\n",
+                  b[0], s_probe_badp[0][0], s_probe_badp[0][1], b[1], s_probe_badp[1][0], s_probe_badp[1][1],
+                  b[2], s_probe_badp[2][0], s_probe_badp[2][1], b[3], s_probe_badp[3][0], s_probe_badp[3][1], c);
     }
     else if (p[0] == 'w' && p[1] == 's' && p[2] == 'e')    // wsetup [0|1]: extra write-data setup tick before AS (REG3 bit15)
     {
@@ -3523,7 +3535,7 @@ static int probe_wr_setup (void)
     for (int st = 0; st <= maxst && chosen < 0; st++)
     {
         hw_set_wr_setup (st);
-        unsigned bad = 0;
+        unsigned bad = 0, badp[2] = {0, 0};
         for (int pass = 0; pass < 2; pass++)
         {
             uint16_t seed = (uint16_t) (0x2468 + st * 0x1111 + pass * 0x4321);
@@ -3532,11 +3544,11 @@ static int probe_wr_setup (void)
             for (unsigned i = 0; i < n; i++) { hw_bus_write (base + 2 * i, 1, (uint16_t) ~(i * 0x9E37 + seed)); if (pass) CTimer::SimpleusDelay (1); }
             hw_bus_write_sync (base + 2 * (n - 1), 1, (uint16_t) ~((n - 1) * 0x9E37 + seed));
             hw_bus_read_block (base, n, buf);
-            for (unsigned i = 0; i < n; i++) if (buf[i] != (uint16_t) ~(i * 0x9E37 + seed)) bad++;
+            for (unsigned i = 0; i < n; i++) if (buf[i] != (uint16_t) ~(i * 0x9E37 + seed)) { bad++; badp[pass]++; }
         }
-        s_probe_bad[st] = bad;
-        CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: +%d tick(s): %u/%u words lost (%s-clock cycles)",
-                        st, bad, 2 * n, s_probe_slow ? "5" : "4");
+        s_probe_bad[st] = bad; s_probe_badp[st][0] = badp[0]; s_probe_badp[st][1] = badp[1];
+        CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: +%d tick(s): %u/%u words lost (%u back-to-back, %u 1 us apart; %s-clock cycles)",
+                        st, bad, 2 * n, badp[0], badp[1], s_probe_slow ? "5" : "4");
         if (!bad) chosen = st;
     }
     // no loss-free tick: take the one that lost least (the later on a tie).
