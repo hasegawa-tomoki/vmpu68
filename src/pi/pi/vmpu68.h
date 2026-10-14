@@ -133,6 +133,7 @@ int      vmpu68_irq_pin(void);          /* PI_IRQ level: irq_en & (ipl!=0 | snoo
 uint16_t vmpu68_bus_read (uint32_t addr, int word, uint16_t *out);
 uint16_t vmpu68_bus_read_fc(uint32_t addr, int word, unsigned fc, uint16_t *out);
 uint16_t vmpu68_bus_write(uint32_t addr, int word, uint16_t data);
+uint16_t vmpu68_bus_write_fc(uint32_t addr, int word, uint16_t data, unsigned fc);   /* synchronous, any FC (7 = engine configuration, docs 56.14) */
 void     vmpu68_bus_write_posted(uint32_t addr, int word, uint16_t data);  /* no completion wait */
 uint16_t vmpu68_bus_drain(void);        /* wait until the command queue is empty */
 /* word read through the FPGA's sequential prefetch stream: when addr is the

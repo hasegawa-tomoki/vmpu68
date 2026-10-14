@@ -818,6 +818,25 @@ uint16_t hw_bus_write_sync(uint32_t a, int w, uint16_t d)
     HWUNLOCK();
     return r;
 }
+/* bus output delay (docs 56.13/56.14): a CPU-space (FC = 7) word write that
+ * the 1.0.1 (1.1.3) bitstream latches as its configuration register 0.  An
+ * older bitstream runs it as a bus cycle nobody answers: fault, cleared here,
+ * and the value is reported as unsupported (-2). */
+static int out_delay_shadow = -1;
+int hw_set_out_delay(int n)
+{
+    n &= 3;
+    if (mock) { out_delay_shadow = n; return n; }
+    HWLOCK_SYNC();
+    posted = 0;
+    uint16_t st = vmpu68_bus_write_fc(0, 1, (uint16_t)n, 7);
+    if (st & VST_FAULT) { hw_clear_fault_u(); out_delay_shadow = -2; }
+    else out_delay_shadow = n;
+    HWUNLOCK();
+    return out_delay_shadow;
+}
+int hw_out_delay(void) { return out_delay_shadow; }
+
 int  hw_snoop_pop(vmpu68_snoop_t *rec) { HWLOCK(); int r = hw_snoop_pop_u(rec); HWUNLOCK(); return r; }
 int  hw_snoop_pop_nolock(vmpu68_snoop_t *rec) { return hw_snoop_pop_u(rec); }
 void hw_set_snoop_hook(void (*fn)(void)) { snoop_fn = fn; vmpu68_set_snoop_hook(fn); }

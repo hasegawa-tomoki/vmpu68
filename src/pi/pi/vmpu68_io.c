@@ -1013,6 +1013,29 @@ uint16_t vmpu68_bus_write(uint32_t addr, int word, uint16_t data)
     return wait_done();
 }
 
+/* synchronous write with an explicit function code.  FC = 7 (CPU space) is
+ * the engine's configuration port from FPGA 1.0.1 (1.1.3) on: the command
+ * is consumed, no bus cycle runs, addr[3:1] selects the register (0 =
+ * output delay).  An older bitstream runs it as a bus cycle nobody answers
+ * (timeout -> fault, which the caller clears).  Bypasses the ai mirror. */
+uint16_t vmpu68_bus_write_fc(uint32_t addr, int word, uint16_t data, unsigned fc)
+{
+    uint16_t base = (uint16_t)(VCTRL_FC(fc) | (word ? VCTRL_WORD : 0) | ((addr >> 16) & 0xFF) | wt_bit);
+    vmpu68_ctrl_invalidate();
+    pf_next = 1;
+    vmpu68_reg_write(VREG_DATA, data);
+    if (autostart_mode) {
+        set_ctrl(base);
+        vmpu68_reg_write(VREG_ADDR_LO, (uint16_t)addr);     /* starts the cycle */
+    } else {
+        vmpu68_reg_write(VREG_ADDR_LO, (uint16_t)addr);
+        vmpu68_reg_write(VREG_CTRL, base);
+    }
+    uint16_t st = wait_done();
+    vmpu68_ctrl_invalidate();
+    return st;
+}
+
 /* posted write: the FPGA queues up to 64 commands in order; the caller
  * must drain (vmpu68_bus_drain) before 64 are outstanding */
 void vmpu68_bus_write_posted(uint32_t addr, int word, uint16_t data)

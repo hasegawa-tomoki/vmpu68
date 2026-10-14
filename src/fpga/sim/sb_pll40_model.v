@@ -19,10 +19,18 @@ module SB_PLL40_CORE #(
     input  wire BYPASS
 );
     assign PLLOUTCORE = PLLOUTGLOBAL;
+    // The 64 MHz edges start 3 ns after time 0 so that none of them lands on
+    // a clk16 edge (31.25 ns multiples): a coincident edge is a race in the
+    // clk16 synchronizer (negedge sample) and the simulator's event order then
+    // decided the tick phase, which could differ between tests of one run.
+    // The hardware PLL (61/16) never has a fixed phase anyway.
     initial begin
         PLLOUTGLOBAL = 0;
         LOCK = 0;
         #1000 LOCK = 1;
     end
-    always #7.8125 PLLOUTGLOBAL = ~PLLOUTGLOBAL;
+    initial begin
+        #3;
+        forever #7.8125 PLLOUTGLOBAL = ~PLLOUTGLOBAL;
+    end
 endmodule

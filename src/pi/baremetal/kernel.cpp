@@ -64,6 +64,7 @@ static unsigned s_bus_mhz10;                   // measured bus clock in 0.1 MHz 
 static const cfg_bus_class *s_bus_cls;         // the timing class in use (config.h)
 static int s_bus_setup_auto = -1;              // wr_setup found by the boot probe (-1 = not probed)
 static int s_bus_slow_pref = 0;                // console 'slow 1': 5-clock bus cycles, kept across every BootX68 (diagnostics)
+static const int kOutDelay10 = 1;              // core 1.0, 4-clock class: bus output delay in internal clocks (docs 56.14: 1 and 3 are clean cold on every board with FB2EB282, 0 loses, 2 breaks)
 static unsigned s_probe_bad[8];                // boot probe: words lost at wr_setup +0..+7 (131072-word samples, both bit directions; +4..+7 need FPGA 1.0.1)
 static int s_probe_ok = -1;                    // -1 not probed, 1 a loss-free setting was found, 0 losses at every setting (A/B health)
 static int s_probe_slow = -1;                  // bus cycle type the probe ran with (0 = 4-clock, 1 = 5-clock)
@@ -1694,6 +1695,15 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         if (*p >= '0' && *p <= '9') { emu_quiesce (); s_bus_slow_pref = parse_num (p) ? 1 : 0; hw_set_bus_slow (s_bus_slow_pref); }
         R.Format ("bus cycle %s%s\r\n", hw_bus_slow () ? "5 clocks (slow)" : "4 clocks", s_bus_slow_pref ? " (kept across resets)" : "");
     }
+    else if (p[0] == 'o' && p[1] == 'd' && p[2] == 'e')    // odelay [0-3]: bus outputs n internal clocks later (FPGA 1.0.1 config register, docs 56.14; the boot class rule reapplies at the next bootstrap)
+    {
+        p += 6;
+        while (*p == ' ') p++;
+        if (*p >= '0' && *p <= '9') { emu_quiesce (); hw_set_out_delay (parse_num (p)); }
+        int od = hw_out_delay ();
+        if (od == -2) R = "out_delay: the bitstream has no config register (its own rule: 1 when slow=0)\r\n";
+        else R.Format ("out_delay %d internal clock(s)%s\r\n", od < 0 ? 0 : od, od < 0 ? " (never set)" : "");
+    }
     else if (p[0] == 'a' && p[1] == 's')                   // as <0|1>: 2-write bus cycle mode (faster)
     {
         p += 2;
@@ -2707,7 +2717,8 @@ static void fpga_version_fixup (void)
             { 0x83F73070, 0x000100 }, { 0x9610EB35, 0x000101 }, { 0x016736A9, 0x000102 }, { 0xCE273913, 0x000103 },
             { 0x4A3402A2, 0x000105 }, { 0x60AFBB62, 0x000106 }, { 0x8B345498, 0x000107 }, { 0x6EE83BCE, 0x000108 },
             { 0xA54FC955, 0x000109 }, { 0x6714AB36, 0x00010D }, { 0xF2B1BAC5, 0x000111 }, { 0x64DA5713, 0x010000 },   // 1.0.0 (same bitstream as 0.1.18)
-            { 0xCFA4A6A1, 0x010001 },   // 1.0.1 (1.1.3: wr_setup on 4-clock cycles (docs 55), writes end on tick16 (56.6), data held to tick16h (56.11), dtack_drv/psram_ce driven (56.8), bus outputs one clk later when slow=0 (56.13))
+            { 0xFB2EB282, 0x010001 },   // 1.0.1 (1.1.3: wr_setup on 4-clock cycles (docs 55), writes end on tick16 (56.6), data held to tick16h (56.11), dtack_drv/psram_ce driven (56.8), bus output delay by config register, default one clk when slow=0 (56.13/56.14))
+            { 0xCFA4A6A1, 0x010001 },   // 1.0.1 rc17 (output delay fixed to slow=0 -> 1, no config register)
             { 0x3B251A61, 0x010001 },   // 1.0.1 rc16 (no output stage: cold-start write loss at 16 MHz, docs 56.13)
         };
         for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) if (known[i].sum == sum && len == 135100) { flags = known[i].ver; from = "release table"; }
@@ -3620,12 +3631,19 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     // The json 'slow' key or the console 'slow 1' pins it either way.
     int slow_on = (c->slow >= 0 ? c->slow : (c->min_mhz10 < 130)) || s_bus_slow_pref;
     hw_set_bus_slow (slow_on);
+    // bus output delay (docs 56.13/56.14): the 4-clock class drives the bus one internal clock later on the
+    // 2.x boards (their edges land on the X68000's falling-edge sample point at 16 MHz when the machine is
+    // cold; 1e-2 of the Pi's main RAM writes lost in the first minutes); core 1.0's path is ~16 ns earlier
+    // and takes kOutDelay10.  The 5-clock class (10 MHz) keeps the direct outputs.
+    int od = c->out_delay >= 0 ? c->out_delay : (slow_on ? 0 : (vmpu68_board_id () == 1 ? kOutDelay10 : 1));
+    int od_set = hw_set_out_delay (od);
     s_bus_setup_auto = -1;
     int setup = c->wr_setup >= 0 ? hw_set_wr_setup (c->wr_setup) : (s_bus_setup_auto = probe_wr_setup ());
-    CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock %u.%u MHz: class >= %u.%u MHz (%s) - wr_setup +%d%s, wait %u ns, io %u MHz, ai %s, %s-clock cycles%s",
+    CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock %u.%u MHz: class >= %u.%u MHz (%s) - wr_setup +%d%s, wait %u ns, io %u MHz, ai %s, %s-clock cycles%s, out_delay %d%s",
                     s_bus_mhz10 / 10, s_bus_mhz10 % 10, c->min_mhz10 / 10, c->min_mhz10 % 10, cfg_bus_source (),
                     setup, c->wr_setup < 0 ? " (probed)" : "", c->wait_ns, c->io_mhz, c->ai ? "on" : "off",
-                    slow_on ? "5" : "4", s_bus_slow_pref ? " (console)" : c->slow < 0 ? " (auto)" : " (json)");
+                    slow_on ? "5" : "4", s_bus_slow_pref ? " (console)" : c->slow < 0 ? " (auto)" : " (json)",
+                    od, od_set == -2 ? " (bitstream has no config register: its own rule applies)" : c->out_delay < 0 ? " (auto)" : " (json)");
     emu68k_snoop_apply ();
     unsigned rambad = emu68k_wb_enabled () ? 0 : emu68k_shadow_check ();   // write-back: the real RAM lags the shadow by design
     uint32_t first = ~0u;

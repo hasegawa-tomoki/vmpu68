@@ -48,6 +48,7 @@ struct cfg_bus_class
     unsigned io_mhz;
     int      ai;
     int      slow;                      // bus cycle: -1 = auto (5-clock below 13 MHz, 4-clock above; docs 56), 0 = 4-clock, 1 = 5-clock
+    int      out_delay;                 // bus outputs n internal clocks later (docs 56.13/56.14): -1 = auto (4-clock class: 1 on core 2.x, core 1.0's value; 5-clock class: 0), 0..3
 };
 void cfg_bus_load (void);               // (re)read the file; defaults when absent/invalid
 unsigned cfg_bus_count (void);

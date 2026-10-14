@@ -267,9 +267,20 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     assign buf_d_oe_n = d_oe_n;
     localparam [48:0] OIDLE = {4'b1111, 23'd0, 3'd0, 16'd0, 1'b0, 1'b0, 1'b0};
     wire [48:0] ocur = {as_n_q, uds_n_q, lds_n_q, rw_q, la_q, fc_q, ld_q, ld_drive_q, d_dir_q, d_oe_n_q};
-    reg  [48:0] odly1 = OIDLE;
-    always @(posedge clk) odly1 <= ocur;
-    wire [48:0] osel = slow ? ocur : odly1;
+    // Engine configuration (docs 56.14): a write command with FC = 7 (CPU
+    // space - a 68000 never writes there and the Pi never did) is consumed
+    // in IDLE instead of being run as a bus cycle; addr[3:1] selects a
+    // register, the data is the value.  Register 0 = output delay 0..3 clk.
+    // Until the Pi writes it the 4-clock class keeps the one-clk delay, so
+    // an older kernel still gets the 16 MHz fix on the 2.x boards.  Core
+    // 1.0's output path lands ~16 ns earlier and wants another value: the
+    // kernel knows the board, the bitstream does not.
+    reg         cfg_valid = 1'b0;
+    reg  [1:0]  cfg_odelay = 2'd0;
+    wire [1:0]  odelay = cfg_valid ? cfg_odelay : {1'b0, ~slow};
+    reg  [48:0] odly1 = OIDLE, odly2 = OIDLE, odly3 = OIDLE;
+    always @(posedge clk) begin odly1 <= ocur; odly2 <= odly1; odly3 <= odly2; end
+    wire [48:0] osel = (odelay == 2'd0) ? ocur : (odelay == 2'd1) ? odly1 : (odelay == 2'd2) ? odly2 : odly3;
     always @* {as_n_o, uds_n_o, lds_n_o, rw_o, la_o, fc_o, ld_o, ld_drive, d_dir, d_oe_n} = osel;
     reg         snoop_push;         // declared before the initial block below (iverilog needs declaration before use)
     initial begin
@@ -446,6 +457,9 @@ module bus_engine #(parameter SNOOP_AW = 9) (
                 own    <= 1'b0;
                 wdog   <= 12'd0;
                 st <= ST_GISO;
+            end else if (cmd_rdy && !c_rw && c_fc == 3'b111) begin   // CPU-space write: engine configuration, no bus cycle
+                if (c_addr[3:1] == 3'd0) begin cfg_odelay <= c_wdata[1:0]; cfg_valid <= 1'b1; end
+                cmd_pop <= 1'b1;
             end else if (cmd_rdy) begin
                 la_q    <= c_addr;
                 p_a0    <= c_a0;
