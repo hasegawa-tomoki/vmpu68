@@ -53,7 +53,13 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     // ---- misc ----
     output wire        led_r,
     output wire        led_g,
-    output wire        led_b
+    output wire        led_b,
+    // core 2.1 pins (unconnected on 1.x/2.0/2.0.1): the DTACK driver Q4 (EXDTACK) must be held
+    // OFF and the PSRAM chips deselected.  Left undriven, Q4's base floats and the bus DTACK
+    // comes early at random - main RAM writes lost 0.3-0.7% of the words on a 2.1 board with
+    // the EXDTACK wire in place, varying with time/temperature (docs 56.8, 56.10)
+    output wire        dtack_drv,
+    output wire [1:0]  psram_ce_n
 );
 
     // ------------------------------------------------------------------
@@ -231,6 +237,9 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     assign led_r = led[2] ? 1'b0 : 1'bz;
     assign led_g = led[1] ? 1'b0 : 1'bz;
     assign led_b = led[0] ? 1'b0 : 1'bz;
+
+    assign dtack_drv  = 1'b0;      // Q4 off (core 2.1); no-op elsewhere
+    assign psram_ce_n = 2'b11;     // PSRAM deselected (core 2.1); no-op elsewhere
 
 endmodule
 

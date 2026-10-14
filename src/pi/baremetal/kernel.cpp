@@ -2704,7 +2704,7 @@ static void fpga_version_fixup (void)
             { 0x83F73070, 0x000100 }, { 0x9610EB35, 0x000101 }, { 0x016736A9, 0x000102 }, { 0xCE273913, 0x000103 },
             { 0x4A3402A2, 0x000105 }, { 0x60AFBB62, 0x000106 }, { 0x8B345498, 0x000107 }, { 0x6EE83BCE, 0x000108 },
             { 0xA54FC955, 0x000109 }, { 0x6714AB36, 0x00010D }, { 0xF2B1BAC5, 0x000111 }, { 0x64DA5713, 0x010000 },   // 1.0.0 (same bitstream as 0.1.18)
-            { 0xD67286B2, 0x010001 },   // 1.0.1 (1.1.3: write-data setup applied to 4-clock cycles too (docs 55); writes always end on tick16 like a 68000 (docs 56.6))
+            { 0x3B251A61, 0x010001 },   // 1.0.1 (1.1.3: wr_setup on 4-clock cycles (docs 55), writes end on tick16 (56.6), data held to tick16h (56.11), dtack_drv/psram_ce driven (56.8))
         };
         for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) if (known[i].sum == sum && len == 135100) { flags = known[i].ver; from = "release table"; }
     }

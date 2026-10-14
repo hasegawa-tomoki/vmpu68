@@ -216,7 +216,11 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     wire exec_busy = (st == ST_ADDR) || (st == ST_ADDR1) || (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_WPRE) ||
                      (st == ST_STROBE) || (st == ST_WAIT) || (st == ST_VPA) ||
                      (st == ST_END) || (st == ST_END2) || (st == ST_END3);
-    wire fast_st   = (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_END2) || (st == ST_END3);
+    // END2 (write data hold after the strobes negated) now lasts until tick16h: half a bus clock
+    // like a 68000's S7->S0, instead of one ~16 ns clk - cold main RAM latched mixed old/new
+    // nibbles with the short hold (docs 56.11).  END3 (bus release) stays at clk rate, so the
+    // next cycle still starts at the next tick16.
+    wire fast_st   = (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_END3);
     // A write always ends on the falling-edge phase (4-clock tail, strobes
     // negated a 68000's S7 after DTACK): with END on tick16 the strobes
     // stay asserted half a bus clock longer after the CRTC's DTACK, and the
@@ -235,7 +239,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     // chips (D15:12 or D11:0 kept the old content) about 3 times per million
     // words on core 1.0.  Writes now always end on tick16 (68000 timing);
     // reads keep the 4-clock tail (their data latch margin is a different story).
-    wire half_st   = ((st == ST_END) && !slow && p_rw) || (!slow && (st == ST_ADDR1));
+    wire half_st   = ((st == ST_END) && !slow && p_rw) || (!slow && (st == ST_ADDR1)) || (st == ST_END2);
     wire adv       = half_st ? tick16h : (tick16 || fast_st);
     // speculative fetches are not "busy" for the Pi: it waits on pf_count
     assign busy = cmd_rdy || (exec_busy && !p_spec) || start;
@@ -545,7 +549,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
             st <= p_rw ? ST_IDLE : ST_END2;   // write data stays driven one more clock
         end
 
-        ST_END2: st <= ST_END3;          // data hold after the strobes negated
+        ST_END2: st <= ST_END3;          // (tick16h) data held half a bus clock after the strobes negated
 
         ST_END3: begin                   // release the data bus, buffer back to input
             d_oe_n   <= 1'b1;
