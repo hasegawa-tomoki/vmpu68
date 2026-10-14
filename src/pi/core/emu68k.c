@@ -133,6 +133,7 @@ static inline void wbrk_check(uint32_t a) {
 int  emu68k_brk_hit(void) { return brk_hit; }
 static unsigned cur_irq, hook_ctr;
 static int rng_pending;               /* a lost-write range waits to be re-read (see sn_repair) */
+int emu68k_snoop_apply(void);          /* (below) drain the snoop FIFO and re-read lost ranges */
 static void sn_inwait_hook(void);
 static inline void fdc_expire(void);
 static inline void pace_tick(void);   /* defined with the pacing state below */
@@ -1420,6 +1421,7 @@ unsigned int m68k_read_memory_8(unsigned int a)
         gpip_before_read(a);
         slow_begin();
         uint16_t st = hw_bus_read(a, 0, &v);
+        if (io && ((st & VST_SNOOP) || rng_pending)) emu68k_snoop_apply();   /* see the word read: DMA writes before this I/O read reach the shadow first */
         slow_end(a, 0, 0);
         if (io) io_done(0);
         if (st & VST_FAULT) bus_fault();
@@ -1454,6 +1456,13 @@ unsigned int m68k_read_memory_16(unsigned int a)
         uint16_t st = hw_bus_read(a, 1, &v);
         slow_end(a, 0, 1);
         if (io) io_done(0);
+        /* ordering: DMAC writes that preceded this I/O read on the bus (a
+         * completion poll of the DMAC's CSR, say) must be in the shadow
+         * before the CPU acts on the value.  Drain the FIFO to empty and
+         * re-read any range the FIFO overflowed on (docs 56.7: a burst
+         * DMA of 16 K words overflows the 1024-entry FIFO every time, and
+         * the CPU read stale shadow 254 words once). */
+        if (io && ((st & VST_SNOOP) || rng_pending)) emu68k_snoop_apply();
         if (st & VST_FAULT) bus_fault();
         if (watch_hit(a)) watch_log(a, v, 2, 1);
         return v;
@@ -1690,6 +1699,8 @@ static int int_ack(int level)
     }
     uint32_t pre = hw_iack_prefault;
     int r = hw_iack((unsigned)level, &vec);
+    /* ordering, as for I/O reads: a DMAC completion interrupt follows the DMAC's writes on the bus - fold them into the shadow before the handler runs (docs 56.7) */
+    if ((hw_iack_st & VST_SNOOP) || rng_pending) emu68k_snoop_apply();
     iack_ring[iack_wp++ & (IACK_N - 1)] =
         (uint16_t)((vec << 8) | ((r & 3) << 4) | (level & 7));
     if (level <= 4 || iack_log_all) {

@@ -205,8 +205,8 @@ static const char *s_BusSource = "built-in";
 static void bus_defaults (void)
 {
     s_BusN = 2;
-    s_Bus[0] = { 0,   -1, 500, 10, 1, -1 };    // 10 MHz machines (slow auto = on: the 4-clock read tail latches text VRAM data too early)
-    s_Bus[1] = { 130, -1, 500, 16, 1, -1 };    // XVI at 16 MHz: wr_setup probed, slow auto = off
+    s_Bus[0] = { 0,   -1, 500, 10, 1, -1 };    // 10 MHz machines
+    s_Bus[1] = { 130, -1, 500, 16, 1, -1 };    // XVI at 16 MHz: wr_setup probed (2 in practice)
     s_BusSource = "built-in";
 }
 

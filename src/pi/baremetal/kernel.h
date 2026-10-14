@@ -65,6 +65,9 @@ private:
     void FpgaFlash (CDevice *pDev, const char *pPath);
     boolean FpgaFlashImage (CDevice *pDev, const u8 *pImage, unsigned nLength);
     int     FpgaFlashCompare (CDevice *pDev, const u8 *img, unsigned len);   // 0 same, 1 differs, -1 no chip
+    boolean FpgaFlashRead (u8 *img, unsigned len);
+    boolean FpgaBackupPrev (CDevice *pDev, unsigned len);   // A/B: save the bitstream a try update replaces
+    boolean FpgaRestorePrev (CDevice *pDev);                // A/B rollback: put it back
     void FpgaDiag (CDevice *pDev);
     boolean Update (CDevice *pDev, const char *pPath, boolean bTry, boolean bForce);
     void RunUpdate (CDevice *pDev, const char *pPath);

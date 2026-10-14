@@ -27,6 +27,7 @@ extern "C" {
 #include "../core/jit.h"
 #endif
 }
+const char *vmpu68_ab_state (void);          // A/B boot state for the status page (kernel.cpp, C++ linkage)
 
 #ifdef VMPU68_WITH_EMU
 void vmpu68_emu_ensure (void);               // defined in kernel.cpp
@@ -38,6 +39,8 @@ unsigned vmpu68_bus_mhz (void);              // measured X68000 bus clock (kerne
 unsigned vmpu68_bus_mhz10 (void);
 unsigned vmpu68_equiv_mhz10 (void);          // 68000-equivalent MHz x10 (kernel.cpp)
 int vmpu68_bus_setup_auto (void);
+int vmpu68_bus_probe_ok (void);
+const unsigned *vmpu68_bus_probe_lost (void);
 struct cfg_bus_class; const cfg_bus_class *vmpu68_bus_class (void);
 #define EMU_PAUSE(on) vmpu68_emu_pause (on)
 #else
@@ -57,12 +60,16 @@ static unsigned bus_mhz10 (void)   { return vmpu68_bus_mhz10 (); }
 static unsigned cls_min10 (void)   { const cfg_bus_class *c = vmpu68_bus_class (); return c ? c->min_mhz10 : 0; }
 static const char *cls_source (void) { return vmpu68_bus_class () ? cfg_bus_source () : "-"; }
 static int setup_auto (void)       { const cfg_bus_class *c = vmpu68_bus_class (); return c && c->wr_setup < 0; }
+static int probe_ok (void)         { return vmpu68_bus_probe_ok (); }
+static const unsigned *probe_lost (void) { return vmpu68_bus_probe_lost (); }
 static unsigned io_mhz_now (void)  { return emu68k_io_mhz (); }
 #else
 static unsigned bus_mhz10 (void) { return 0; }
 static unsigned cls_min10 (void) { return 0; }
 static const char *cls_source (void) { return "-"; }
 static int setup_auto (void) { return 0; }
+static int probe_ok (void) { return -1; }
+static const unsigned *probe_lost (void) { static const unsigned z[8]; return z; }
 static unsigned io_mhz_now (void) { return 0; }
 #endif
 static unsigned ram_mb (void)
@@ -274,8 +281,9 @@ THTTPStatus CVmpuWebServer::GetContent (const char *pPath, const char *pParams,
         Content.Format ("{\"device\":\"vmpu68\",\"name\":\"%s\",\"mac\":\"%s\","
                         "\"status\":%u,\"busy\":%s,\"fault\":%s,\"snoop_avail\":%s,"
                         "\"ipl\":%u,\"vpa\":%s,\"mock\":%s,\"board\":%d,\"firmware\":\"baremetal\","
-                        "\"version\":\"" VMPU68_VERSION "\",\"pi_version\":\"" VMPU68_PI_VERSION "\",\"fpga_version\":\"%s\",\"build\":\"" VMPU68_BUILD "\",\"uptime\":%u,\"fpga_sum\":\"%s\",\"ram_mb\":%u,\"bus_mhz\":%u.%u,\"bus_class_min_mhz\":%u.%u,\"bus_class_source\":\"%s\",\"wr_ai\":%s,\"smi\":%s,\"psram\":%s,\"wr_setup\":%u,\"wr_setup_auto\":%s,\"io_mhz\":%u,\"wait_ns\":%u,\"equiv_mhz\":%u.%u,\"mhz_limit\":%u,\"wb\":%s,\"jit\":%s,\"sramboot\":%s,\"hw\":\"%s\","
-                        "\"update\":{\"busy\":%s,\"phase\":\"%s\",\"done\":%u,\"total\":%u,\"msg\":\"%s\"},%s}",
+                        "\"version\":\"" VMPU68_VERSION "\",\"pi_version\":\"" VMPU68_PI_VERSION "\",\"fpga_version\":\"%s\",\"build\":\"" VMPU68_BUILD "\",\"uptime\":%u,\"fpga_sum\":\"%s\",\"ram_mb\":%u,\"bus_mhz\":%u.%u,\"bus_class_min_mhz\":%u.%u,\"bus_class_source\":\"%s\",\"wr_ai\":%s,\"smi\":%s,\"wr_setup\":%u,\"wr_setup_auto\":%s,\"io_mhz\":%u,\"wait_ns\":%u,\"equiv_mhz\":%u.%u,\"mhz_limit\":%u,\"wb\":%s,\"jit\":%s,\"sramboot\":%s,\"hw\":\"%s\","
+                        "\"bus_slow\":%s,\"probe_ok\":%d,\"probe_lost\":[%u,%u,%u,%u,%u,%u,%u,%u],\"ab\":\"%s\","
+                        "\"update\":{\"busy\":%s,\"phase\":\"%s\",\"done\":%u,\"total\":%u,\"msg\":\"%s\"}}",
                         (const char *) Name, (const char *) Mac, st,
                         (st & VST_BUSY) ? "true" : "false",
                         (st & VST_FAULT) ? "true" : "false",
@@ -286,6 +294,7 @@ THTTPStatus CVmpuWebServer::GetContent (const char *pPath, const char *pParams,
                         vmpu68_board_id (),
 fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz10 () % 10, cls_min10 () / 10, cls_min10 () % 10, cls_source (), hw_wr_ai () ? "true" : "false", hw_smi () ? "true" : "false", vmpu68_psram_on () ? "true" : "false", hw_wr_setup (),
                         setup_auto () ? "true" : "false", io_mhz_now (), vmpu68_get_wait_ns (), vmpu68_equiv_mhz10 () / 10, vmpu68_equiv_mhz10 () % 10, vmpu68_mhz_limit (), emu68k_wb_enabled () ? "true" : "false", jit_enabled () ? "true" : "false", cfg_sramboot () ? "true" : "false", vmpu68_hw_rev (),
+                        hw_bus_slow () ? "true" : "false", probe_ok (), probe_lost ()[0], probe_lost ()[1], probe_lost ()[2], probe_lost ()[3], probe_lost ()[4], probe_lost ()[5], probe_lost ()[6], probe_lost ()[7], vmpu68_ab_state (),
                         g_Update.busy ? "true" : "false", g_Update.phase,
                         g_Update.done, g_Update.total, g_Update.msg, (const char *) Ids);
         // circle's daemon has no header hook: ride the CORS header on the

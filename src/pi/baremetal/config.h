@@ -52,7 +52,7 @@ struct cfg_bus_class
     unsigned wait_ns;
     unsigned io_mhz;
     int      ai;
-    int      slow;                      // 5-clock bus cycles (reads: data latched later); -1 = auto (on below 13 MHz, docs 55)
+    int      slow;                      // bus cycle: -1 = auto (5-clock below 13 MHz, 4-clock above; docs 56), 0 = 4-clock, 1 = 5-clock
 };
 void cfg_bus_load (void);               // (re)read the file; defaults when absent/invalid
 unsigned cfg_bus_count (void);

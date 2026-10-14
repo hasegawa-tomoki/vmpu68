@@ -290,7 +290,18 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     // display data land in the text screen (function key row garbage at
     // 16 MHz, docs 30).  Reads keep the slow timing: their data latch
     // margin after DTACK is what the 5-clock cycle was kept for.
-    wire half_st   = ((st == ST_END) && (!slow || !p_rw)) || (!slow && (st == ST_ADDR1));
+    // 2026-10-14 (docs 56.1): the phantom-cycle story above was a misdiagnosis
+    // (docs 43), and at 10 MHz the 4-clock write tail depends on the
+    // bitstream's placement: Pi->text-VRAM writes were lost on 1.0.1 (1.5%)
+    // but not on 1.0.0.  slow=1 (the 10 MHz class) now ends writes on tick16
+    // as well - the 5-clock timing of the first releases for reads and writes.
+    // 2026-10-14 (docs 56.6): a write's strobes were negated half a bus clock
+    // after DTACK in the 4-clock mode - a 68000 keeps them a full clock (S5-S6)
+    // - and the XVI's main RAM then missed the write in one of its four nibble
+    // chips (D15:12 or D11:0 kept the old content) about 3 times per million
+    // words on core 1.0.  Writes now always end on tick16 (68000 timing);
+    // reads keep the 4-clock tail (their data latch margin is a different story).
+    wire half_st   = ((st == ST_END) && !slow && p_rw) || (!slow && (st == ST_ADDR1));
     wire adv       = half_st ? tick16h : (tick16 || fast_st);
     // speculative fetches are not "busy" for the Pi: it waits on pf_count
     assign busy = cmd_rdy || (exec_busy && !p_spec) || start;
