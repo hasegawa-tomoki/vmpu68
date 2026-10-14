@@ -185,7 +185,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     assign pf_count  = pf_cnt;
     assign pf_head   = pf_q[pf_rp[2:0]];
 
-    // ---- bus timing (docs 57: bus-clock-synchronous outputs) ----
+    // ---- bus timing (docs 57, variant D: address group on the rising edge) ----
     // Every bus output leaves the FPGA through an SB_IO output register that
     // is clocked by the bus clock itself (vmpu68_top).  Address, FC, R/W and
     // data are registered on the falling edge; AS/UDS/LDS use the DDR output:
@@ -244,10 +244,14 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     wire exec_busy = (st == ST_ADDR) || (st == ST_RDW) || (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_WEN2) ||
                      (st == ST_WEN3) || (st == ST_STROBE) || (st == ST_WAIT) || (st == ST_VPA) ||
                      (st == ST_LATCH) || (st == ST_END);
-    wire h_st    = (st == ST_ADDR) || (st == ST_STROBE) || (st == ST_LATCH) ||
-                   (st == ST_RDW) || (st == ST_WSETUP);                      // tick16h: rising-edge strobe values
+    // variant D: address/FC/R/W/data are captured at the RISING edge, so they
+    // are decided on tick16h together with the rising-edge strobe values
+    // (IDLE/END/ADDR/STROBE/RDW); the falling-edge strobe release and the
+    // buffer turnaround run on tick16 (WAIT/VPA/WSETUP).
+    wire h_st    = (st == ST_IDLE) || (st == ST_END) || (st == ST_ADDR) || (st == ST_STROBE) ||
+                   (st == ST_LATCH) || (st == ST_RDW);                       // tick16h
     wire fast_st = (st == ST_WEN) || (st == ST_WEN2) || (st == ST_WEN3);    // D-buffer turnaround, clk rate
-    wire adv     = h_st ? tick16h : (fast_st ? 1'b1 : tick16);              // tick16: address/data, strobe release
+    wire adv     = h_st ? tick16h : (fast_st ? 1'b1 : tick16);              // tick16: WSETUP, WAIT, VPA, grant
     // speculative fetches are not "busy" for the Pi: it waits on pf_count
     assign busy = cmd_rdy || (exec_busy && !p_spec) || start;
 
@@ -514,7 +518,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
         end
 
         if (adv) case (st)
-        ST_IDLE: begin                   // (tick16) address/data decisions
+        ST_IDLE: begin                   // (tick16h) address/data decisions (captured at the rising edge)
             own  <= 1'b1;
             bg_n <= 1'b1;
             vma_req <= 1'b0;
@@ -574,17 +578,17 @@ module bus_engine #(parameter SNOOP_AW = 9) (
             wdog <= wdog + 12'd1;
             if (dtack_s) begin
                 as_n_f <= 1'b1; uds_n_f <= 1'b1; lds_n_f <= 1'b1;
-                st <= ST_LATCH;
+                st <= ST_END;
             end else if (berr_s) begin
                 if (!p_spec) berr_flag <= 1'b1;   // a speculative fault is not the Pi's
                 p_bad <= 1'b1;
                 as_n_f <= 1'b1; uds_n_f <= 1'b1; lds_n_f <= 1'b1;
-                st <= ST_LATCH;
+                st <= ST_END;
             end else if (vpa_s) begin
                 if (p_pf || p_spec) begin // no E-cycle for a streamed read: just end it
                     p_bad <= 1'b1;       // (the Pi never streams from the I/O area)
                     as_n_f <= 1'b1; uds_n_f <= 1'b1; lds_n_f <= 1'b1;
-                    st <= ST_LATCH;
+                    st <= ST_END;
                 end else begin
                     vma_req <= 1'b1;
                     st <= ST_VPA;
@@ -593,7 +597,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
                 if (!p_spec) timeout_flag <= 1'b1;
                 p_bad <= 1'b1;
                 as_n_f <= 1'b1; uds_n_f <= 1'b1; lds_n_f <= 1'b1;
-                st <= ST_LATCH;
+                st <= ST_END;
             end
         end
 
@@ -604,11 +608,11 @@ module bus_engine #(parameter SNOOP_AW = 9) (
                 vma_req <= 1'b0;
                 vpa_flag <= 1'b1;
                 as_n_f <= 1'b1; uds_n_f <= 1'b1; lds_n_f <= 1'b1;
-                st <= ST_LATCH;
+                st <= ST_END;
             end
         end
 
-        ST_LATCH: begin                  // (tick16h) read data (the bus just before the strobes go up)
+        ST_END: begin                    // (tick16h) read data latched (the bus just before the strobes go up), next cycle dispatched
             if (p_pf || p_spec) begin    // streamed read: data goes to the FIFO
                 if (!p_bad) begin
                     pf_q[pf_wp[2:0]] <= ld_q1;
@@ -620,14 +624,14 @@ module bus_engine #(parameter SNOOP_AW = 9) (
                 if (p_pf) pf_fc <= fc_o;
             end else if (p_rw && !vpa_flag)   // VPA cycles latched their data in ST_VPA
                 rdata <= p_word ? ld_q1 : (p_a0 ? {8'h00, ld_q1[7:0]} : {8'h00, ld_q1[15:8]});
-            st <= ST_END;
-        end
-
-        ST_END: begin                    // (tick16) dispatch the next cycle (the strobes went up at the falling edge)
             // a write's data stays driven until the next tick16h unless the next
             // command is a write taken now, whose data simply replaces it
             if (!p_rw && !next_is_write) rel_req <= 1'b1;
-            dispatch(1'b1, pf_run, pf_a, pf_cnt, pf_fc);
+            dispatch(1'b1,
+                     (p_pf || p_spec) ? pf_run_n : pf_run,
+                     (p_pf || p_spec) ? pf_a_n : pf_a,
+                     ((p_pf || p_spec) && !p_bad) ? pf_cnt_n : pf_cnt,
+                     p_pf ? fc_o : pf_fc);
         end
 
         // ---- bus grant + snoop ----

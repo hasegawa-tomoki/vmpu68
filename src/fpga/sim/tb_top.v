@@ -119,12 +119,12 @@ module tb_top;
             $display("FAIL phase: a strobe released off the falling edge @%0t", $time); errors = errors + 1;
         end
     always @(f_la or f_fc or f_rw)
-        if ($time > 2000 && dut.own && $time != t_own && $time != t_fall) begin
-            $display("FAIL phase: address/FC/R/W changed off the falling edge @%0t", $time); errors = errors + 1;
+        if ($time > 2000 && dut.own && $time != t_own && $time != t_rise) begin
+            $display("FAIL phase: address/FC/R/W changed off the rising edge @%0t", $time); errors = errors + 1;
         end
     always @(f_ld)
-        if ($time > 2000 && dut.ld_drive && $time != t_ldd && $time != t_fall) begin
-            $display("FAIL phase: write data changed off the falling edge @%0t", $time); errors = errors + 1;
+        if ($time > 2000 && dut.ld_drive && $time != t_ldd && $time != t_rise) begin
+            $display("FAIL phase: write data changed off the rising edge @%0t", $time); errors = errors + 1;
         end
     always @(f_ld)
         if ($time > 2000 && dut.own && f_as_n === 1'b0 && f_rw === 1'b0 && dut.ld_drive && $time != t_ldd) begin

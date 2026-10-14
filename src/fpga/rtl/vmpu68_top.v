@@ -203,33 +203,33 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     );
 
     // ---- bus pins: output registers clocked by the bus clock (docs 57) ----
-    // Address/FC/R/W/data change after the falling edge; AS/UDS/LDS are DDR
-    // outputs (asserted after a rising edge, released after a falling edge);
+    // Address/FC/R/W/data change after the rising edge (variant D); AS/UDS/LDS
+    // are DDR outputs (asserted after a rising edge, released after a falling edge);
     // the enables (own, ld_drive) are the engine's, unregistered.
     // The input taps (D_IN_0) feed the snoop logic and the read data path.
     localparam [5:0] OREG = 6'b100101;     // registered output, enable from the fabric, plain input
     genvar gi;
     generate
         for (gi = 1; gi <= 23; gi = gi + 1) begin : g_la
-            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u (
+            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b0)) u (
                 .PACKAGE_PIN(la[gi]), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own),
                 .D_OUT_0(la_o[gi]), .D_IN_0(la_in[gi]),
                 .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
         end
         for (gi = 0; gi < 16; gi = gi + 1) begin : g_ld
-            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u (
+            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b0)) u (
                 .PACKAGE_PIN(ld[gi]), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(ld_drive),
                 .D_OUT_0(ld_o[gi]), .D_IN_0(ld_in[gi]),
                 .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
         end
         for (gi = 0; gi < 3; gi = gi + 1) begin : g_fc
-            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u (
+            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b0)) u (
                 .PACKAGE_PIN(lfc[gi]), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own),
                 .D_OUT_0(fc_o[gi]), .D_IN_0(fc_in[gi]),
                 .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
         end
     endgenerate
-    SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u_rw (
+    SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b0)) u_rw (
         .PACKAGE_PIN(l_rw), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own), .D_OUT_0(rw_o), .D_IN_0(rw_in),
         .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
     // the strobes: DDR output, D_OUT_0 shows after the rising edge, D_OUT_1 after the falling edge
