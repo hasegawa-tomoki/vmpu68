@@ -58,6 +58,7 @@ int  hw_set_wr_setup(int n);       /* extra bus clocks of write-data setup befor
 int  hw_wr_setup(void);
 int  hw_set_out_delay(int n);      /* bus outputs n internal clocks later, 0-3 (FPGA 1.0.1 config register, docs 56.14); returns the value, -2 = the bitstream has no config register */
 int  hw_out_delay(void);           /* last value set, -1 = never, -2 = unsupported */
+int  hw_bus_cfg(unsigned reg, unsigned val);   /* bus engine configuration register (CPU-space write; FPGA 1.0.2: reg 1 = rd5 bit0 / wr4 bit1, docs 57); -2 = no config register */
 int  hw_set_snoop2(int on);        /* snoop stream v2 (needs the bitstream; returns the effective mode) */
 int  hw_snoop2(void);
 void hw_clear_fault(void);                 /* clear sticky BERR/timeout flag */

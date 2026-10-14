@@ -99,6 +99,38 @@ module tb_top;
         errors = errors + 1;
     end
 
+    // ---------------- output phase assertions (docs 57) ----------------
+    // While the engine owns the bus, AS/UDS/LDS may only be asserted right at
+    // a clk16 rising edge and released right at a falling edge, and
+    // address/FC/R/W may only change at a falling edge (the IO registers;
+    // clock-to-out is zero in this model).  Changes in the same
+    // time step as an enable (own / ld_drive) are the pins going to or from Z.
+    time t_rise = 0, t_fall = 0, t_own = 0, t_ldd = 0;
+    always @(posedge clk16) t_rise = $time;
+    always @(negedge clk16) t_fall = $time;
+    always @(dut.own) t_own = $time;
+    always @(dut.ld_drive) t_ldd = $time;
+    always @(negedge f_as_n or negedge f_uds_n or negedge f_lds_n)
+        if ($time > 2000 && dut.own && $time != t_own && $time != t_rise) begin
+            $display("FAIL phase: a strobe asserted off the rising edge @%0t", $time); errors = errors + 1;
+        end
+    always @(posedge f_as_n or posedge f_uds_n or posedge f_lds_n)
+        if ($time > 2000 && dut.own && $time != t_own && $time != t_fall) begin
+            $display("FAIL phase: a strobe released off the falling edge @%0t", $time); errors = errors + 1;
+        end
+    always @(f_la or f_fc or f_rw)
+        if ($time > 2000 && dut.own && $time != t_own && $time != t_fall) begin
+            $display("FAIL phase: address/FC/R/W changed off the falling edge @%0t", $time); errors = errors + 1;
+        end
+    always @(f_ld)
+        if ($time > 2000 && dut.ld_drive && $time != t_ldd && $time != t_fall) begin
+            $display("FAIL phase: write data changed off the falling edge @%0t", $time); errors = errors + 1;
+        end
+    always @(f_ld)
+        if ($time > 2000 && dut.own && f_as_n === 1'b0 && f_rw === 1'b0 && dut.ld_drive && $time != t_ldd) begin
+            $display("FAIL phase: write data changed while AS was asserted @%0t", $time); errors = errors + 1;
+        end
+
     // ---------------- RESET/HALT loopback (Q1/Q2 open-drain model) --------
     // rst_drv=1 turns on Q1 which pulls the bus RESET line low; sensed back
     // through the input buffer as l_reset_n.
@@ -735,15 +767,15 @@ module tb_top;
             pi_write(2'd3, 16'h0040);
         end
 
-        // 14. engine configuration by a CPU-space write (docs 56.14): consumed by
-        // the engine, no bus cycle; register 0 = output delay.  0 brings the
-        // 4-clock class back to 4 clocks in this fixed-phase model, 1 (the rc17
-        // default when nothing was written) reads as 5 here (see 13).
+        // 14. engine configuration by a CPU-space write (docs 57): consumed by
+        // the engine, no bus cycle; register 1 bit 0 = rd5 (reads take an idle
+        // tick before AS: 5 clocks), bit 1 = wr4.  Register 0 (FPGA 1.0.1's
+        // output delay) is accepted and ignored.
         begin : cfg_wr
             integer k;
-            time as_d0;
             mon_as = 1; as_fall = 0; as_min = 0; as_max = 0; as_n_cyc = 0; as_lo_min = 0; as_lo_max = 0;
-            bus_cycle_fc(3'b111, 1'b0, 1'b1, 24'h000000, 16'h0000, rd);   // out delay 0
+            bus_cycle_fc(3'b111, 1'b0, 1'b1, 24'h000000, 16'h0001, rd);   // register 0: ignored
+            bus_cycle_fc(3'b111, 1'b0, 1'b1, 24'h000002, 16'h0001, rd);   // register 1: rd5
             #500;
             if (as_fall != 0) begin $display("FAIL cfg write ran a bus cycle"); errors = errors + 1; end
             mon_as = 0;
@@ -759,30 +791,31 @@ module tb_top;
                 if (rd !== 16'hA000 + k[15:0]) begin $display("FAIL cfg word %0d: %04x", k, rd); errors = errors + 1; end
             end
             mon_as = 0;
-            $display("info stream AS-to-AS out_delay=0: %0d cycles, min %0t max %0t", as_n_cyc, as_min, as_max);
-            if (as_min != 64'd250 && as_min != 64'd312) begin
-                $display("FAIL cfg out_delay 0: AS-to-AS min %0t, want 4 or 5 bus clocks", as_min);
+            $display("info stream AS-to-AS rd5=1: %0d cycles, min %0t max %0t; AS low min %0t max %0t",
+                     as_n_cyc, as_min, as_max, as_lo_min, as_lo_max);
+            if (as_min != 64'd312 && as_min != 64'd375) begin
+                $display("FAIL cfg rd5: AS-to-AS min %0t, want 5 or 6 bus clocks", as_min);
                 errors = errors + 1;
             end
-            as_d0 = as_min;
             bus_cycle(1'b1, 1'b1, 24'h004400, 16'h0, rd);   // flush the stream
-            bus_cycle_fc(3'b111, 1'b0, 1'b1, 24'h000000, 16'h0001, rd);   // out delay 1
+            bus_cycle_fc(3'b111, 1'b0, 1'b1, 24'h000002, 16'h0000, rd);   // register 1: rd5 off
             for (k = 0; k < 8; k = k + 1)
                 post_write(24'h004400 + 2 * k[23:0], 16'hB000 + k[15:0]);
             pi_read(2'd3, st);
             while (st[0]) pi_read(2'd3, st);
             mon_as = 1; as_fall = 0; as_min = 0; as_max = 0; as_n_cyc = 0; as_lo_min = 0; as_lo_max = 0;
             pf_read(24'h004400, rd);
-            if (rd !== 16'hB000) begin $display("FAIL cfg word 0 (delay 1): %04x", rd); errors = errors + 1; end
+            if (rd !== 16'hB000) begin $display("FAIL cfg word 0 (rd5=0): %04x", rd); errors = errors + 1; end
             for (k = 1; k < 8; k = k + 1) pf_next(rd);
             mon_as = 0;
-            $display("info stream AS-to-AS out_delay=1: %0d cycles, min %0t max %0t", as_n_cyc, as_min, as_max);
-            if (as_min < as_d0 || as_min > as_d0 + 64'd63) begin   // the delayed outputs never shorten a cycle, and add at most one bus clock
-                $display("FAIL cfg out_delay 1: AS-to-AS min %0t vs %0t with out_delay 0", as_min, as_d0);
+            $display("info stream AS-to-AS rd5=0: %0d cycles, min %0t max %0t; AS low min %0t max %0t",
+                     as_n_cyc, as_min, as_max, as_lo_min, as_lo_max);
+            if (as_min != 64'd250 && as_min != 64'd312) begin
+                $display("FAIL cfg rd5=0: AS-to-AS min %0t, want 4 or 5 bus clocks", as_min);
                 errors = errors + 1;
             end
             bus_cycle(1'b1, 1'b1, 24'h004400, 16'h0, rd);   // flush the stream
-            $display("pass cfg write (out delay 0/1)");
+            $display("pass cfg write (rd5 1/0)");
         end
 
         // 6c (last: it grants the bus to the DMAC model and would upset the measurements below)

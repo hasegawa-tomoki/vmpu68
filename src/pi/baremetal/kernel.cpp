@@ -1731,6 +1731,18 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
          * made every status poll a silent halt (docs 32.3) */
         R.Format ("emu %s (pc=%06X)\r\n", s_emu_run ? "running" : "stopped", emu68k_pc ());
     }
+    else if (p[0] == 'b' && p[1] == 'c' && p[2] == 'f')    // bcfg <reg> <val>: bus engine configuration register (CPU-space write; FPGA 1.0.2: reg 1 = rd5 (bit0, reads 5 clocks) / wr4 (bit1), docs 57)
+    {
+        p += 4;
+        while (*p == ' ') p++;
+        unsigned reg = parse_num (p);
+        while (*p == ' ') p++;
+        unsigned val = parse_num (p);
+        emu_quiesce ();
+        int r = hw_bus_cfg (reg, val);
+        if (r) R = "bcfg: the bitstream has no config register\r\n";
+        else R.Format ("bcfg: register %u = %u\r\n", reg, val);
+    }
     else if (p[0] == 'b' && p[1] == 'c' && p[2] == 'l')    // bcls: bus clock class in use + the table
     {
         R.Format ("bus clock %u.%u MHz, classes from %s:\r\n", s_bus_mhz10 / 10, s_bus_mhz10 % 10, cfg_bus_source ());

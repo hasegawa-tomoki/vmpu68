@@ -836,6 +836,17 @@ int hw_set_out_delay(int n)
     return out_delay_shadow;
 }
 int hw_out_delay(void) { return out_delay_shadow; }
+int hw_bus_cfg(unsigned reg, unsigned val)
+{
+    if (mock) return 0;
+    HWLOCK_SYNC();
+    posted = 0;
+    uint16_t st = vmpu68_bus_write_fc((reg & 7) * 2, 1, (uint16_t)val, 7);
+    int r = (st & VST_FAULT) ? -2 : 0;
+    if (r) hw_clear_fault_u();
+    HWUNLOCK();
+    return r;
+}
 
 int  hw_snoop_pop(vmpu68_snoop_t *rec) { HWLOCK(); int r = hw_snoop_pop_u(rec); HWUNLOCK(); return r; }
 int  hw_snoop_pop_nolock(vmpu68_snoop_t *rec) { return hw_snoop_pop_u(rec); }

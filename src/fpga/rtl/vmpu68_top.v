@@ -7,7 +7,9 @@
 // internal clock.  Everything runs in that single domain; 68000-bus state
 // machines advance on tick16 (clk16 rising edge detected in the fast
 // domain), so bus timing is identical to a 16MHz design while the Pi
-// interface samples 4x faster.  Buffer output enables are gated by PLL
+// interface samples 4x faster.  The bus outputs themselves are re-timed by
+// the bus clock in the IO registers (docs 57), so their position on the bus
+// does not depend on the PLL phase.  Buffer output enables are gated by PLL
 // lock so the 5V bus stays isolated until the clock is stable.
 `default_nettype none
 
@@ -72,12 +74,20 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     // VCCPLL1 = TQ144 pin 126, which core 1.0 left unconnected (wrong
     // library symbol) -> reworked with a jumper to pin 111 (VCC).
     // ------------------------------------------------------------------
+    // The bus clock pad is GBIN3 (TQ144 pin 93): besides feeding the PLL it
+    // drives a global net that clocks the bus output registers (docs 57).
+    wire clk16_g, clk16_i;
+    SB_GB_IO #(.PIN_TYPE(6'b000001)) u_clk16 (
+        .PACKAGE_PIN(clk16), .GLOBAL_BUFFER_OUTPUT(clk16_g), .D_IN_0(clk16_i),
+        .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .OUTPUT_CLK(1'b0),
+        .OUTPUT_ENABLE(1'b0), .D_OUT_0(1'b0), .D_OUT_1(1'b0)
+    );
     wire clk, pll_lock;
     SB_PLL40_CORE #(
         .FEEDBACK_PATH("SIMPLE"),
         .DIVR(4'd0), .DIVF(7'd60), .DIVQ(3'd4), .FILTER_RANGE(3'd1)
     ) u_pll (
-        .REFERENCECLK(clk16),
+        .REFERENCECLK(clk16_i),
         .PLLOUTGLOBAL(clk),
         .LOCK(pll_lock),
         .RESETB(1'b1),
@@ -95,7 +105,7 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     // the negative clk edge, puts the FSM update 39-65ns after the falling
     // edge = 4-30ns after the following rising edge.
     reg       c16n;
-    always @(negedge clk) c16n <= clk16;
+    always @(negedge clk) c16n <= clk16_g;   // the same net that clocks the output registers
     reg [1:0] c16p;
     always @(posedge clk) c16p <= {c16p[0], c16n};
     wire tick16 = (c16p == 2'b10);
@@ -128,7 +138,7 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     wire [1:0]  wr_setup;
 
     pi_if u_pi (
-        .clk(clk), .clk16(clk16), .pll_lock(pll_lock), .pi_ad(pi_ad), .pi_reg_a(pi_reg_a),
+        .clk(clk), .clk16(clk16_i), .pll_lock(pll_lock), .pi_ad(pi_ad), .pi_reg_a(pi_reg_a),
         .pi_wr_n(pi_wr_n), .pi_rd_n(pi_rd_n), .pi_irq(pi_irq),
         .cyc_start(cyc_start), .cyc_addr(cyc_addr), .cyc_a0(cyc_a0),
         .cyc_wdata(cyc_wdata), .cyc_rw(cyc_rw), .cyc_word(cyc_word), .cyc_fc(cyc_fc),
@@ -155,11 +165,15 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     // ------------------------------------------------------------------
     wire        own;
     wire [23:1] la_o;
-    wire        as_n_o, uds_n_o, lds_n_o, rw_o;
+    wire        as_n_r, as_n_f, uds_n_r, uds_n_f, lds_n_r, lds_n_f, rw_o;
     wire [2:0]  fc_o;
     wire [15:0] ld_o;
     wire        ld_drive;
     wire        i_buf_d_dir, i_buf_d_oe_n, i_buf_a_dir, i_buf_a_oe_n;
+    wire [23:1] la_in;                 // pad taps of the bus pins (SB_IO D_IN_0, below)
+    wire [15:0] ld_in;
+    wire [2:0]  fc_in;
+    wire        as_in, uds_in, lds_in, rw_in;
 
     bus_engine #(.SNOOP_AW(SNOOP_AW)) u_bus (
         .clk(clk), .tick16(tick16), .tick16h(tick16h), .slow(bus_slow), .wr_setup(wr_setup),
@@ -171,10 +185,10 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
         .cmd_full(cmd_full), .cmd_ovf(cmd_ovf), .flags_clr(flags_clr),
 
         .own(own),
-        .la_o(la_o), .as_n_o(as_n_o), .uds_n_o(uds_n_o), .lds_n_o(lds_n_o),
+        .la_o(la_o), .as_n_r(as_n_r), .as_n_f(as_n_f), .uds_n_r(uds_n_r), .uds_n_f(uds_n_f), .lds_n_r(lds_n_r), .lds_n_f(lds_n_f),
         .rw_o(rw_o), .fc_o(fc_o),
-        .la_i(la), .fc_i(lfc), .as_n_i(l_as_n), .uds_n_i(l_uds_n), .lds_n_i(l_lds_n), .rw_i(l_rw),
-        .ld_o(ld_o), .ld_drive(ld_drive), .ld_i(ld),
+        .la_i(la_in), .fc_i(fc_in), .as_n_i(as_in), .uds_n_i(uds_in), .lds_n_i(lds_in), .rw_i(rw_in),
+        .ld_o(ld_o), .ld_drive(ld_drive), .ld_i(ld_in),
 
         .dtack_n(l_dtack_n), .berr_n(l_berr_n), .vpa_n(l_vpa_n),
         .br_n(l_br_n), .bgack_n(l_bgack_n), .bg_n(l_bg_n),
@@ -188,15 +202,48 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
         .snoop_ovf(snoop_ovf), .snoop_rst(snoop_rst)
     );
 
-    // ---- tri-state pin drivers (buf_a group follows own) ----
-    assign la      = own ? la_o    : 23'bz;
-    assign l_as_n  = own ? as_n_o  : 1'bz;
-    assign l_uds_n = own ? uds_n_o : 1'bz;
-    assign l_lds_n = own ? lds_n_o : 1'bz;
-    assign l_rw    = own ? rw_o    : 1'bz;
-    assign lfc     = own ? fc_o    : 3'bz;
-    assign l_vma_n = own ? vma_n_int : 1'bz;
-    assign ld      = ld_drive ? ld_o : 16'bz;
+    // ---- bus pins: output registers clocked by the bus clock (docs 57) ----
+    // Address/FC/R/W/data change after the falling edge; AS/UDS/LDS are DDR
+    // outputs (asserted after a rising edge, released after a falling edge);
+    // the enables (own, ld_drive) are the engine's, unregistered.
+    // The input taps (D_IN_0) feed the snoop logic and the read data path.
+    localparam [5:0] OREG = 6'b100101;     // registered output, enable from the fabric, plain input
+    genvar gi;
+    generate
+        for (gi = 1; gi <= 23; gi = gi + 1) begin : g_la
+            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u (
+                .PACKAGE_PIN(la[gi]), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own),
+                .D_OUT_0(la_o[gi]), .D_IN_0(la_in[gi]),
+                .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
+        end
+        for (gi = 0; gi < 16; gi = gi + 1) begin : g_ld
+            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u (
+                .PACKAGE_PIN(ld[gi]), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(ld_drive),
+                .D_OUT_0(ld_o[gi]), .D_IN_0(ld_in[gi]),
+                .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
+        end
+        for (gi = 0; gi < 3; gi = gi + 1) begin : g_fc
+            SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u (
+                .PACKAGE_PIN(lfc[gi]), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own),
+                .D_OUT_0(fc_o[gi]), .D_IN_0(fc_in[gi]),
+                .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
+        end
+    endgenerate
+    SB_IO #(.PIN_TYPE(OREG), .NEG_TRIGGER(1'b1)) u_rw (
+        .PACKAGE_PIN(l_rw), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own), .D_OUT_0(rw_o), .D_IN_0(rw_in),
+        .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0), .D_OUT_1(1'b0));
+    // the strobes: DDR output, D_OUT_0 shows after the rising edge, D_OUT_1 after the falling edge
+    localparam [5:0] ODDR = 6'b100001;
+    SB_IO #(.PIN_TYPE(ODDR), .NEG_TRIGGER(1'b0)) u_as (
+        .PACKAGE_PIN(l_as_n), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own), .D_OUT_0(as_n_r), .D_OUT_1(as_n_f), .D_IN_0(as_in),
+        .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0));
+    SB_IO #(.PIN_TYPE(ODDR), .NEG_TRIGGER(1'b0)) u_uds (
+        .PACKAGE_PIN(l_uds_n), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own), .D_OUT_0(uds_n_r), .D_OUT_1(uds_n_f), .D_IN_0(uds_in),
+        .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0));
+    SB_IO #(.PIN_TYPE(ODDR), .NEG_TRIGGER(1'b0)) u_lds (
+        .PACKAGE_PIN(l_lds_n), .OUTPUT_CLK(clk16_g), .OUTPUT_ENABLE(own), .D_OUT_0(lds_n_r), .D_OUT_1(lds_n_f), .D_IN_0(lds_in),
+        .LATCH_INPUT_VALUE(1'b0), .CLOCK_ENABLE(1'b1), .INPUT_CLK(1'b0));
+    assign l_vma_n = own ? vma_n_int : 1'bz;   // E-clock engine, fast domain
 
     assign l_e        = e_clk;
 
