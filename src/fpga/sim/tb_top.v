@@ -101,8 +101,8 @@ module tb_top;
 
     // ---------------- output phase assertions (docs 57) ----------------
     // While the engine owns the bus, AS/UDS/LDS may only be asserted right at
-    // a clk16 falling edge and released right at a rising edge (variant B),
-    // and address/FC/R/W may only change at a falling edge (the IO registers;
+    // a clk16 rising edge and released right at a falling edge, and
+    // address/FC/R/W may only change at a falling edge (the IO registers;
     // clock-to-out is zero in this model).  Changes in the same
     // time step as an enable (own / ld_drive) are the pins going to or from Z.
     time t_rise = 0, t_fall = 0, t_own = 0, t_ldd = 0;
@@ -111,12 +111,12 @@ module tb_top;
     always @(dut.own) t_own = $time;
     always @(dut.ld_drive) t_ldd = $time;
     always @(negedge f_as_n or negedge f_uds_n or negedge f_lds_n)
-        if ($time > 2000 && dut.own && $time != t_own && $time != t_fall) begin
-            $display("FAIL phase: a strobe asserted off the falling edge @%0t", $time); errors = errors + 1;
+        if ($time > 2000 && dut.own && $time != t_own && $time != t_rise) begin
+            $display("FAIL phase: a strobe asserted off the rising edge @%0t", $time); errors = errors + 1;
         end
     always @(posedge f_as_n or posedge f_uds_n or posedge f_lds_n)
-        if ($time > 2000 && dut.own && $time != t_own && $time != t_rise) begin
-            $display("FAIL phase: a strobe released off the rising edge @%0t", $time); errors = errors + 1;
+        if ($time > 2000 && dut.own && $time != t_own && $time != t_fall) begin
+            $display("FAIL phase: a strobe released off the falling edge @%0t", $time); errors = errors + 1;
         end
     always @(f_la or f_fc or f_rw)
         if ($time > 2000 && dut.own && $time != t_own && $time != t_fall) begin

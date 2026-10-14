@@ -1763,6 +1763,46 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
             R.Append (L);
         }
     }
+    else if (p[0] == 'w' && p[1] == 'c' && p[2] == 'h')    // wcheck <addr> <words> [seed] [gap_us]: posted writes of a pattern then its complement (saved/restored), read back, list the first 24 mismatches
+    {
+        p += 6;
+        while (*p == ' ') p++;
+        unsigned addr = parse_num (p);
+        while (*p == ' ') p++;
+        unsigned n = parse_num (p);
+        while (*p == ' ') p++;
+        unsigned seed = *p ? parse_num (p) : 0x1234;
+        while (*p == ' ') p++;
+        unsigned gap = *p ? parse_num (p) : 0;
+        if (n == 0 || n > 65536) n = 65536;
+        uint16_t *save = (uint16_t *) malloc (2 * n), *buf = (uint16_t *) malloc (2 * n);
+        if (!save || !buf) { free (save); free (buf); R = "wcheck: no memory\r\n"; }
+        else
+        {
+            emu_quiesce ();
+            hw_bus_read_block (addr, n, save);
+            for (unsigned i = 0; i < n; i++) { hw_bus_write (addr + 2 * i, 1, (uint16_t) (i * 0x9E37 + seed)); if (gap) CTimer::SimpleusDelay (gap); }
+            hw_bus_write_sync (addr + 2 * (n - 1), 1, (uint16_t) ((n - 1) * 0x9E37 + seed));
+            for (unsigned i = 0; i < n; i++) { hw_bus_write (addr + 2 * i, 1, (uint16_t) ~(i * 0x9E37 + seed)); if (gap) CTimer::SimpleusDelay (gap); }
+            hw_bus_write_sync (addr + 2 * (n - 1), 1, (uint16_t) ~((n - 1) * 0x9E37 + seed));
+            hw_bus_read_block (addr, n, buf);
+            unsigned bad = 0, old1 = 0, listed = 0;
+            CString L;
+            for (unsigned i = 0; i < n; i++)
+            {
+                uint16_t want = (uint16_t) ~(i * 0x9E37 + seed);
+                if (buf[i] == want) continue;
+                bad++;
+                if (buf[i] == (uint16_t) (i * 0x9E37 + seed)) old1++;   // the first pass's value: the second write was lost whole
+                if (listed < 24) { L.Format ("  %06X got %04X want %04X (pass-1 %04X)\r\n", addr + 2 * i, buf[i], want, (uint16_t) (i * 0x9E37 + seed)); R.Append (L); listed++; }
+            }
+            L.Format ("wcheck %06X x%u seed %X gap %u us: bad %u (first-pass value kept %u)\r\n", addr, n, seed, gap, bad, old1);
+            R.Append (L);
+            for (unsigned i = 0; i < n; i++) hw_bus_write (addr + 2 * i, 1, save[i]);
+            hw_bus_write_sync (addr + 2 * (n - 1), 1, save[n - 1]);
+            free (save); free (buf);
+        }
+    }
     else if (p[0] == 'w' && p[1] == 's' && p[2] == 'p')    // wsprobe: run the boot-time write-data setup probe again (emulator stopped meanwhile; results in the log and /api/status probe_lost)
     {
         emu_quiesce ();
