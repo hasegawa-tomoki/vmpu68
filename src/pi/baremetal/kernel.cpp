@@ -68,6 +68,8 @@ static unsigned s_probe_bad[8];                // boot probe: words lost at wr_s
 static int s_probe_ok = -1;                    // -1 not probed, 1 a loss-free setting was found, 0 losses at every setting (A/B health)
 static int s_probe_slow = -1;                  // bus cycle type the probe ran with (0 = 4-clock, 1 = 5-clock)
 static const char *probed_str (void);          // " (probed: n)" for bcls
+unsigned vmpu68_pi_throttled (void);           // firmware GET_THROTTLED flags (power supply diagnostics)
+unsigned vmpu68_pi_temp (void);                // SoC temperature (C)
 
 // pace the emulator against the 1 MHz system timer so that ROM/software delay loops
 // calibrated for a 10 MHz 68000 do not collapse (e.g. SCSI ROM selection timeout)
@@ -1445,7 +1447,8 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         unsigned m = parse_num (p);
         CCPUThrottle *t = CCPUThrottle::Get ();
         if (t) t->SetSpeed (m ? CPUSpeedMaximum : CPUSpeedLow);
-        R.Format ("cpu %u MHz %u C\r\n", t ? t->GetClockRate () / 1000000 : 0, t ? t->GetTemperature () : 0);
+        R.Format ("cpu %u MHz %u C throttled %08X (bit0 under-voltage now, bit16 under-voltage occurred, bit2/18 throttled now/occurred)\r\n",
+                  t ? t->GetClockRate () / 1000000 : 0, t ? t->GetTemperature () : 0, vmpu68_pi_throttled ());
     }
     else if (p[0] == 'e' && p[1] == 'b' && p[2] == 'm')    // ebm [addr]: bus timing benchmark (1000 word reads/writes at addr, default $ED0000;
     {                                                      //  an unpopulated addr measures the machine's bus-error timeout: reads only, faults counted)
@@ -2704,7 +2707,8 @@ static void fpga_version_fixup (void)
             { 0x83F73070, 0x000100 }, { 0x9610EB35, 0x000101 }, { 0x016736A9, 0x000102 }, { 0xCE273913, 0x000103 },
             { 0x4A3402A2, 0x000105 }, { 0x60AFBB62, 0x000106 }, { 0x8B345498, 0x000107 }, { 0x6EE83BCE, 0x000108 },
             { 0xA54FC955, 0x000109 }, { 0x6714AB36, 0x00010D }, { 0xF2B1BAC5, 0x000111 }, { 0x64DA5713, 0x010000 },   // 1.0.0 (same bitstream as 0.1.18)
-            { 0x3B251A61, 0x010001 },   // 1.0.1 (1.1.3: wr_setup on 4-clock cycles (docs 55), writes end on tick16 (56.6), data held to tick16h (56.11), dtack_drv/psram_ce driven (56.8))
+            { 0xCFA4A6A1, 0x010001 },   // 1.0.1 (1.1.3: wr_setup on 4-clock cycles (docs 55), writes end on tick16 (56.6), data held to tick16h (56.11), dtack_drv/psram_ce driven (56.8), bus outputs one clk later when slow=0 (56.13))
+            { 0x3B251A61, 0x010001 },   // 1.0.1 rc16 (no output stage: cold-start write loss at 16 MHz, docs 56.13)
         };
         for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) if (known[i].sum == sum && len == 135100) { flags = known[i].ver; from = "release table"; }
     }
@@ -3428,6 +3432,18 @@ int vmpu68_bus_setup_auto (void) { return s_bus_setup_auto; }
 int vmpu68_bus_probe_ok (void) { return s_probe_ok; }
 const unsigned *vmpu68_bus_probe_lost (void) { return s_probe_bad; }
 const char *vmpu68_ab_state (void) { return s_ab_state; }
+
+// Raspberry Pi firmware GET_THROTTLED: bit0 under-voltage now, bit1 frequency capped, bit2 throttled, bit3 soft temperature limit;
+// bits 16-19 the same, sticky since boot.  A clear mask of 0 keeps the sticky bits.  0xFFFFFFFF when the tag fails.
+unsigned vmpu68_pi_throttled (void)
+{
+    CBcmPropertyTags Tags;
+    TPropertyTagSimple T;
+    T.nValue = 0;
+    if (!Tags.GetTag (PROPTAG_GET_THROTTLED, &T, sizeof T, 4)) return 0xFFFFFFFF;
+    return T.nValue;
+}
+unsigned vmpu68_pi_temp (void) { CCPUThrottle *t = CCPUThrottle::Get (); return t ? t->GetTemperature () : 0; }
 static const char *probed_str (void)
 {
     static char buf[24];

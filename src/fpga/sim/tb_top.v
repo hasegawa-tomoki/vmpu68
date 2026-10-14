@@ -720,7 +720,13 @@ module tb_top;
                 mon_as = 0;
                 $display("info stream AS-to-AS slow=%0d: %0d cycles, min %0t max %0t; AS low min %0t max %0t",
                          m, as_n_cyc, as_min, as_max, as_lo_min, as_lo_max);
-                if (as_min != (m ? 64'd312 : 64'd250)) begin        // $time is in ns here
+                // $time is in ns here.  slow=0 drives the bus through the output stage (bus_engine,
+                // docs 56.13): every strobe lands one clk (15.6 ns) later, and in this fixed-phase
+                // model (clk = 4 x clk16, DTACK two clk16 edges after the strobes are sampled) that
+                // crosses the sampling edge, so the 4-clock cycle reads as 5 here.  On the hardware
+                // (clk = 61/16 x clk16, the phase walks through 16 positions) the bench/ebm timings
+                // did not change; accept 4 or 5 for slow=0 and keep the strict 5 for slow=1.
+                if (m ? (as_min != 64'd312) : (as_min != 64'd250 && as_min != 64'd312)) begin
                     $display("FAIL cyc_len: AS-to-AS min %0t, want %0d bus clocks", as_min, m ? 5 : 4);
                     errors = errors + 1;
                 end
