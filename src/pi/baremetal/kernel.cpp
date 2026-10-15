@@ -491,6 +491,7 @@ static void info_update (void)
               vmpu68_get_wait_ns (), emu68k_io_mhz (), CTimer::Get ()->GetUptime ());
     strncpy ((char *) rec + 64, (const char *) T, 127);
     strncpy ((char *) rec + 0xC0, cfg_name (), 31);   // host name (VMPU68.X -n writes a new one here and sets $FA)
+    strncpy ((char *) rec + 0xE0, vmpu68_hw_rev (), 15);   // board revision (VMPU68.X: "MPU: VMPU68 (HW Vx.x FW Vx.x.x)")
     put16 (rec + 0xF0, s_emu_mhz);            // settings, readable and writable by VMPU68.X
     put16 (rec + 0xF2, emu68k_wb_enabled () ? 1 : 0);
     put16 (rec + 0xF4, jit_enabled () ? 1 : 0);

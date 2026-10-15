@@ -284,11 +284,22 @@ bt_ok:          move.l  d7,$8.w
                 lea     msg_crlf(pc),a0
                 bsr     puts
 
-                ; ---- 3 行目: MPU: VMPU68 Vx.x.x   RAM: xMB   Bus: xx.xMHz
+                ; ---- 3 行目: MPU: VMPU68 (HW Vx.x FW Vx.x.x)   RAM: xMB   Bus: xx.xMHz
                 lea     msg_mpu(pc),a0
                 bsr     puts
-                lea     16(a6),a0       ; 版数
+                lea     $E0(a6),a0      ; 基板の版(HW)。1.2.0 以前のカーネルは空
+                tst.b   (a0)
+                bne     .hwok
+                lea     msg_unknown(pc),a0
+                bsr     puts
+                bra     .fw
+.hwok:          bsr     puts_port
+.fw:            lea     msg_fw(pc),a0
+                bsr     puts
+                lea     16(a6),a0       ; カーネル(FW)の版数
                 bsr     puts_port
+                lea     msg_close(pc),a0
+                bsr     puts
                 lea     msg_ram(pc),a0
                 bsr     puts
                 moveq   #0,d0
@@ -306,7 +317,7 @@ bt_ok:          move.l  d7,$8.w
                 lea     msg_crlf(pc),a0
                 bsr     puts
 
-                ; ---- 4 行目: CLOCK: xxx.xMHz equiv. (xx.xx of MC68000 10MHz)
+                ; ---- 4 行目: vCLOCK: xxx.xMHz equiv. (xx.xx of MC68000 10MHz)
                 lea     msg_clock(pc),a0
                 bsr     puts
                 move.l  d5,d0
@@ -447,8 +458,8 @@ squash_sharp:
 sq_tab:         dc.b    0,1, 1,1, 2,2, 4,1, 5,2, 7,1, 8,2, 10,1, 11,2, 13,1, 14,2   ; 16 ラスタ → 11 ラスタ
                 even
 
-; build_settings: 設定行 "SPEED: ...   RAM: ...   JIT: ..." を a2 へ(NUL は書かない)。a6 = 情報ポート。
-;                 設定は情報ポートの +$F0(速度)/+$F2(ライトバック)/+$F4(JIT)。
+; build_settings: 設定行 "SMI: ...   SPEED: ...   CACHE: ...   JIT: ..." を a2 へ(NUL は書かない)。a6 = 情報ポート。
+;                 設定は情報ポートの +$F0(速度)/+$F2(コピーバック)/+$F4(JIT)。
 SET_SPEED       equ     $F0
 SET_WB          equ     $F2
 SET_JIT         equ     $F4
@@ -458,6 +469,16 @@ SET_NAME        equ     $FA             ; 1 を書くと $C0 の文字列をホ�
 SET_SMI         equ     $FC             ; SMI 転送 0/1(読みで 2 = この基板では使えない = V1.0)
 NAMEBUF         equ     $C0             ; ホスト名(32 バイト、NUL 終端。基板が現在の名前を置き、-n はここへ書く)
 build_settings:
+                lea     msg_smi(pc),a0
+                bsr     puts
+                move.w  SET_SMI(a6),d0  ; 0/1、2 = V1.0(SMI 無し)
+                lea     msg_off(pc),a0
+                beq     .stxt
+                lea     msg_on(pc),a0
+                cmp.w   #1,d0
+                beq     .stxt
+                lea     msg_na(pc),a0
+.stxt:          bsr     puts
                 lea     msg_speed(pc),a0
                 bsr     puts
                 move.w  SET_SPEED(a6),d0
@@ -508,34 +529,23 @@ build_settings2:
                 beq     .auto
                 bsr     putdec
                 lea     msg_mbsp(pc),a0
-                bsr     puts
-                bra     .smi
+                bra     puts
 .auto:          lea     msg_auto(pc),a0
-                bsr     puts
-.smi:           lea     msg_smi(pc),a0
-                bsr     puts
-                move.w  SET_SMI(a6),d0  ; 0/1、2 = V1.0(SMI 無し)
-                lea     msg_off(pc),a0
-                beq     .stxt
-                lea     msg_on(pc),a0
-                cmp.w   #1,d0
-                beq     .stxt
-                lea     msg_na(pc),a0
-.stxt:          bra     puts
+                bra     puts
 msg_host:       dc.b    'HOST: ',0
-msg_smi:        dc.b    '   SMI: ',0
-msg_na:         dc.b    '-',0
 msg_bootscr:    dc.b    '   BOOT SCREEN: ',0
 msg_ramsz:      dc.b    '   RAM SIZE: ',0
 msg_mbsp:       dc.b    ' MB',0
 msg_auto:       dc.b    'auto',0
                 even
                 endc
-msg_speed:      dc.b    'SPEED: ',0
+msg_smi:        dc.b    'SMI: ',0
+msg_na:         dc.b    '-',0
+msg_speed:      dc.b    '   SPEED: ',0
 msg_mhzeq:      dc.b    'MHz equivalent',0
 msg_unlim:      dc.b    'Max',0
-msg_ramset:     dc.b    '   RAM: ',0
-msg_wb:         dc.b    'write-back',0
+msg_ramset:     dc.b    '   CACHE: ',0
+msg_wb:         dc.b    'copyback',0
 msg_wt:         dc.b    'write-through',0
 msg_jitset:     dc.b    '   JIT: ',0
 msg_on:         dc.b    'on',0
@@ -663,8 +673,11 @@ IOCS_B_LOCATE   equ     $23
 TVRAM           equ     $E00000
 msg_series:     dc.b    'SERIES',0
 msg_bios:       dc.b    'BIOS ROM version ',0
-msg_mpu:        dc.b    'MPU: VMPU68 V',0
-msg_clock:      dc.b    'CLOCK: ',0
+msg_mpu:        dc.b    'MPU: VMPU68 (HW V',0
+msg_fw:         dc.b    ' FW V',0
+msg_close:      dc.b    ')',0
+msg_unknown:    dc.b    '?',0
+msg_clock:      dc.b    'vCLOCK: ',0
 msg_equiv:      dc.b    'MHz (',0
 msg_ratio:      dc.b    'x MC68000 @ 10MHz)',13,10,0
 msg_bus:        dc.b    '   Bus: ',0
@@ -697,7 +710,7 @@ sstart:
                 bsr     shear_x68000
                 bsr     squash_sharp
                 LEAINFO a6
-                LINEBUF a2              ; 5 行目: 設定(速度 / ライトバック / JIT)
+                LINEBUF a2              ; 5 行目: 設定(SMI / 速度 / キャッシュ / JIT)
                 bsr     build_settings
                 lea     msg_crlf(pc),a0
                 bsr     puts
@@ -1144,15 +1157,13 @@ rstart:
 
 ; ---------------------------------------------------------------- .X 版(VMPU68.X: 情報表示と設定)
 ;   VMPU68            情報と現在の設定を表示
-;   VMPU68 -b         X68030 風の 4 行(SHARP 〜 / BIOS ROM / MPU / CLOCK)だけを表示(AUTOEXEC.BAT 用。
-;                     旧 VMPU68.SYS の起動時表示の代わり)
 ;   VMPU68 -s<MHz>    速度: -s10 / -s16 / -s24 / -s0(全速力)。基板が適用して SD に保存する
-;   VMPU68 -w<0|1>    メイン RAM: -w1 ライトバック / -w0 ライトスルー
+;   VMPU68 -w<0|1>    メイン RAM のキャッシュ(シャドウ RAM): -w1 コピーバック / -w0 ライトスルー
 ;   VMPU68 -j<0|1>    JIT(68000 命令の実行時翻訳): -j1 有効 / -j0 無効
-; 設定は情報ポートの +$F0(速度)/+$F2(ライトバック)/+$F4(JIT)へ書くと基板側が受け取る。
+; 設定は情報ポートの +$F0(速度)/+$F2(コピーバック)/+$F4(JIT)へ書くと基板側が受け取る。
                 ifd     XMODE
 xstart:
-                suba.l  a4,a4           ; a4 = 1 なら -b(4 行だけ表示)。d7 は build_text が使うので使えない
+                suba.l  a4,a4           ; a4 = 0(以前の -b の名残。d7 は build_text が使うので使えない)
                 movea.l a2,a5           ; コマンドライン(先頭 1 バイトは長さ)
                 clr.l   -(sp)
                 dc.w    $FF20           ; DOS _SUPER: スーパーバイザへ
@@ -1180,11 +1191,7 @@ xstart:
                 subq.w  #1,d1
                 move.b  (a5)+,d0
                 or.b    #$20,d0         ; 小文字化
-                cmp.b   #'b',d0
-                bne     .not_b
-                lea     1.w,a4
-                bra     .parse
-.not_b:         cmp.b   #'s',d0
+                cmp.b   #'s',d0
                 beq     .opt_s
                 cmp.b   #'j',d0
                 beq     .opt_j
@@ -1536,11 +1543,11 @@ getnum:         moveq   #0,d2
                 bra     .g
 .gend:          rts
 
-msg_usage:      dc.b    13,10,13,10,'usage: VMPU68 [-b] [-s10|-s16|-s24|-s0] [-w1|-w0] [-j1|-j0] [-i1|-i0] [-m<MB>|-m0]',13,10
-                dc.b    '              [-n<name>] [-t1|-t0] [-d]',13,10
-                dc.b    '  -b: banner only   -s: speed   -w: write-back   -j: JIT   -i: boot screen',13,10
+msg_usage:      dc.b    13,10,13,10,'usage: VMPU68 [-s10|-s16|-s24|-s0] [-w1|-w0] [-j1|-j0] [-i1|-i0] [-m<MB>|-m0]',13,10
+                dc.b    '              [-n<name>] [-t1|-t0] [-d] [-h]',13,10
+                dc.b    '  -s: speed   -w: cache 1=copyback 0=write-through   -j: JIT   -i: boot screen',13,10
                 dc.b    '  -m: RAM size (0=auto, next boot)   -n: host name (up to the next " -")   -t: SMI (V2.0+)',13,10
-                dc.b    '  -d: drive list (unit, driver, SCSI ID)',13,10,13,10,0
+                dc.b    '  -d: drive list (unit, driver, SCSI ID)   -h: this help',13,10,13,10,0
                 even
 namebuf:        ds.b    32              ; ワード転送するので偶数番地に
 infobase:       dc.l    INFO            ; 見つけた情報ポートの番地(build_text が旧番地に切り替えることがある)
