@@ -69,6 +69,8 @@ static unsigned s_probe_bad[8];                // boot probe: words lost at wr_s
 static unsigned s_probe_badp[4][2];            // the same split into the back-to-back pass and the 1 us-apart pass
 static int s_probe_ok = -1;                    // -1 not probed, 1 a loss-free setting was found, 0 losses at every setting (A/B health)
 static int s_probe_slow = -1;                  // bus cycle type the probe ran with (0 = 4-clock, 1 = 5-clock)
+static unsigned s_reprobe_due = 0;             // uptime (s) at which to run the probe again: the last one found the bus unusable (0 = none)
+static int s_reprobe_tries = 0;                // such re-runs since the last BootX68 (at most 3)
 static const char *probed_str (void);          // " (probed: n)" for bcls
 unsigned vmpu68_pi_throttled (void);           // firmware GET_THROTTLED flags (power supply diagnostics)
 unsigned vmpu68_pi_temp (void);                // SoC temperature (C)
@@ -1803,6 +1805,17 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
             free (save); free (buf);
         }
     }
+    else if (p[0] == 'l' && p[1] == 'o' && p[2] == 'g')    // log [n]: the last n bytes (default 3000) of the kernel log ring (what the serial console showed)
+    {
+        p += 3;
+        while (*p == ' ') p++;
+        unsigned want = (*p >= '0' && *p <= '9') ? parse_num (p) : 3000;
+        static char buf[LOGGER_BUFSIZE + 1];
+        int n = CLogger::Get ()->Read (buf, LOGGER_BUFSIZE, FALSE);
+        if (n < 0) n = 0;
+        buf[n] = 0;
+        R.Append (buf + ((unsigned) n > want ? n - want : 0));
+    }
     else if (p[0] == 'w' && p[1] == 's' && p[2] == 'p')    // wsprobe: run the boot-time write-data setup probe again (emulator stopped meanwhile; results in the log and /api/status probe_lost)
     {
         emu_quiesce ();
@@ -2693,6 +2706,13 @@ static void sfl_wren (void)
 // (the FPGA is held in reset), so the Pi's ACT LED blinks at ~8 Hz meanwhile.
 // Called from every yield and from every flash status poll.
 static CKernel *s_pKernel = nullptr;
+static void watchdog_kick (void) { if (s_pKernel) s_pKernel->WatchdogKick (); }
+void CKernel::WatchdogKick (void)
+{
+#ifdef VMPU68_WATCHDOG
+    m_Watchdog.Start (15);
+#endif
+}
 
 // /api/con (webserver.cpp): run one console line through exec_cmd() with the
 // output collected into a string.  The follow-up actions a console would
@@ -3570,6 +3590,7 @@ static int probe_wr_setup (void)
     unsigned t0 = CTimer::Get ()->GetTicks ();
     hw_bus_read_block (base, n, save);
     for (int i = 0; i < 8; i++) s_probe_bad[i] = 0;
+    for (int i = 0; i < 4; i++) s_probe_badp[i][0] = s_probe_badp[i][1] = 0;   // (the loop stops at the first loss-free tick: no stale per-pass counts for the rest)
     const int maxst = 3;                   // REG3 has no free bit for a 4th wr_setup bit (bit2 = flags_clr): 0..3
     s_probe_slow = hw_bus_slow ();
     int chosen = -1;
@@ -3579,6 +3600,7 @@ static int probe_wr_setup (void)
         unsigned bad = 0, badp[2] = {0, 0};
         for (int pass = 0; pass < 2; pass++)
         {
+            watchdog_kick ();                  // a failing probe takes 3-4 s per setting: do not let the 15 s watchdog reset the Pi
             uint16_t seed = (uint16_t) (0x2468 + st * 0x1111 + pass * 0x4321);
             for (unsigned i = 0; i < n; i++) { hw_bus_write (base + 2 * i, 1, (uint16_t) (i * 0x9E37 + seed)); if (pass) CTimer::SimpleusDelay (1); }
             hw_bus_write_sync (base + 2 * (n - 1), 1, (uint16_t) ((n - 1) * 0x9E37 + seed));
@@ -3586,6 +3608,24 @@ static int probe_wr_setup (void)
             hw_bus_write_sync (base + 2 * (n - 1), 1, (uint16_t) ~((n - 1) * 0x9E37 + seed));
             hw_bus_read_block (base, n, buf);
             for (unsigned i = 0; i < n; i++) if (buf[i] != (uint16_t) ~(i * 0x9E37 + seed)) { bad++; badp[pass]++; }
+            if (badp[pass] > n / 2)
+            {
+                // The machine is not taking writes at all: seen after a reset that
+                // switched the bus clock (10 <-> 16.7 MHz), before the IPL has run
+                // (docs 57).  Probing on is pointless (11 s, and at 10 MHz past the
+                // watchdog): keep +1, let the machine boot and probe again then.
+                s_probe_bad[st] = bad; s_probe_badp[st][0] = badp[0]; s_probe_badp[st][1] = badp[1];
+                CLogger::Get ()->Write (FromKernel, LogWarning, "wr_setup probe: +%d tick(s): %u/%u words lost in the %s pass - the bus is not usable right now: keeping +1, probing again once the machine is up",
+                                st, badp[pass], n, pass ? "1 us-apart" : "back-to-back");
+                s_probe_ok = 0;
+                s_reprobe_due = CTimer::Get ()->GetUptime () + 20;
+                hw_set_wr_setup (maxst);
+                for (unsigned i = 0; i < n; i++) hw_bus_write (base + 2 * i, 1, save[i]);
+                hw_bus_write_sync (base + 2 * (n - 1), 1, save[n - 1]);
+                hw_set_wr_setup (1);
+                free (save); free (buf);
+                return 1;
+            }
         }
         s_probe_bad[st] = bad; s_probe_badp[st][0] = badp[0]; s_probe_badp[st][1] = badp[1];
         CLogger::Get ()->Write (FromKernel, LogNotice, "wr_setup probe: +%d tick(s): %u/%u words lost (%u back-to-back, %u 1 us apart; %s-clock cycles)",
@@ -3681,7 +3721,30 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     // writes and the write-data setup - at 16 MHz main RAM lost about 1 in
     // 2000 written words until 2 ticks of setup were added (docs §27.13);
     // "auto" probes it here on the free bus.
+    unsigned prev_mhz10 = s_bus_mhz10;
     s_bus_mhz10 = measure_bus_mhz10 ();
+    if (prev_mhz10 && prev_mhz10 != s_bus_mhz10)
+    {
+        // The XVI's 10/16 MHz switch takes effect at the reset: a reset during
+        // which the clock changes leaves the machine unable to take main RAM
+        // writes for a while (docs 57: the probe lost everything, with every
+        // bitstream), a reset with the clock already settled does not.  So
+        // reset it once more ourselves, like the button, and go on from there.
+        CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock changed %u.%u -> %u.%u MHz at this %s: resetting the machine again with the clock settled",
+                        prev_mhz10 / 10, prev_mhz10 % 10, s_bus_mhz10 / 10, s_bus_mhz10 % 10, bPowerOn ? "power-on" : "reset");
+        hw_set_drv (1, 1);                     // RESET+HALT for 200 ms (xrst does the same)
+        m_Timer.MsDelay (200);
+        hw_set_drv (0, 0);
+        waited = 0;
+        while ((hw_status () & VST_RESET_IN) && waited < 5000)
+        {
+            m_Timer.MsDelay (10);
+            waited += 10;
+        }
+        hw_rst_seen (1);                       // our own pulse set the FPGA's reset latch: clear it, or the supervisor would bootstrap again
+        hw_clear_fault ();
+        m_Timer.MsDelay (200);
+    }
     s_bus_cls = cfg_bus_select (s_bus_mhz10);
     apply_smi_cfg ();                          // SMI strobe timing follows the clock class (10 vs 16 MHz)
     const cfg_bus_class *c = s_bus_cls;
@@ -3703,6 +3766,7 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     int od = c->out_delay >= 0 ? c->out_delay : (slow_on ? 0 : (vmpu68_board_id () == 1 ? kOutDelay10 : 1));
     int od_set = hw_set_out_delay (od);
     s_bus_setup_auto = -1;
+    s_reprobe_due = 0; s_reprobe_tries = 0;
     int setup = c->wr_setup >= 0 ? hw_set_wr_setup (c->wr_setup) : (s_bus_setup_auto = probe_wr_setup ());
     CLogger::Get ()->Write (FromKernel, LogNotice, "bus clock %u.%u MHz: class >= %u.%u MHz (%s) - wr_setup +%d%s, wait %u ns, io %u MHz, ai %s, %s-clock cycles%s, out_delay %d%s",
                     s_bus_mhz10 / 10, s_bus_mhz10 % 10, c->min_mhz10 / 10, c->min_mhz10 % 10, cfg_bus_source (),
@@ -3871,6 +3935,20 @@ TShutdownMode CKernel::Run (void)
         }
 
         info_update ();                        // $ECD000 information port (once a second)
+        if (s_reprobe_due && m_Timer.GetUptime () >= s_reprobe_due)
+        {
+            // the probe found the bus unusable (a reset that switched the clock):
+            // now that the machine is up, pause the emulator for half a second and probe again
+            s_reprobe_due = 0;
+            if (s_emu_run && !hw_is_mock () && s_bus_cls && s_bus_cls->wr_setup < 0 && ++s_reprobe_tries <= 3)
+            {
+                emu_quiesce ();
+                int c = probe_wr_setup ();
+                s_bus_setup_auto = c;
+                CLogger::Get ()->Write (FromKernel, s_probe_ok == 1 ? LogNotice : LogWarning, "wr_setup probe: re-run with the machine up (%d of 3) - using +%d", s_reprobe_tries, c);
+                s_emu_run = TRUE; DataSyncBarrier ();
+            }
+        }
         {
             unsigned off, val;                 // VMPU68.X wrote a setting into the information port
             while (emu68k_info_take_cmd (&off, &val))   // VMPU68.X may queue several settings at once
