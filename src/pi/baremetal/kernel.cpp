@@ -272,6 +272,7 @@ void vmpu68_emu_reset (void)
     emu_ensure ();
     emu_quiesce ();
     emu68k_reset ();
+    vscsi_on_reset ();                         // ejected virtual IDs go back to the real bus
     s_emu_run = TRUE;
     DataSyncBarrier ();
 }
@@ -633,8 +634,21 @@ boolean CKernel::Initialize (void)
 #endif
     if (bOK) bOK = m_EMMC.Initialize ();
     if (bOK) bOK = (f_mount (&m_FileSystem, "SD:", 1) == FR_OK);
+    if (bOK) sdimg_init (m_EMMC.GetSize ());   // image volume (2nd partition, "SD2:") if the card has one
     if (bOK) cfg_load ();               // SD:/vmpu68.cfg (name=, ram=, mhz=, board=)
     if (bOK) cfg_bus_load ();           // SD:/vmpu68-bus.json (bus timing per clock class)
+#ifdef VMPU68_WITH_EMU
+    if (bOK)                            // virtual SCSI: file I/O task on this core, then the images from vmpu68.cfg
+    {
+        vscsi_start_io_task ();
+        for (unsigned id = 0; id < 7; id++)
+        {
+            int ro = 0; const char *path = cfg_vscsi (id, &ro);
+            if (path[0] && vscsi_mount (id, path, ro != 0) != 0)
+                CLogger::Get ()->Write (FromKernel, LogWarning, "vscsi: ID %u: cannot mount %s", id, path);
+        }
+    }
+#endif
     if (bOK) fpga_version_fixup ();     // SD:/fpga.sum without a version: take it from SD:/update.vpk when the bitstream matches
 
     // board GPIO layout: vmpu68.cfg board= wins; otherwise ask the FPGA
@@ -1903,6 +1917,51 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
                   w.on ? "on" : "off", w.limit, w.depth, w.max_depth, (unsigned long long) w.issued, w.full_waits, w.syncs, w.sync_waits,
                   (unsigned long long) (w.sync_t / 54), (unsigned long long) (w.sync_max_t / 54), w.sync_timeouts, (unsigned long long) (w.issue_t / 54000));
     }
+    else if (p[0] == 'v' && p[1] == 's' && (p[2] == 0 || p[2] == ' '))   // vs: virtual SCSI port / worker statistics
+    {
+        vscsi_stats (R);
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'm')    // vsm <id> <path> [ro]: mount a virtual SCSI image (saved to vmpu68.cfg)
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned id = parse_num (p); while (*p == ' ') p++;
+        char path[128]; unsigned n = 0; while (*p && *p != ' ' && n < sizeof path - 1) path[n++] = *p++; path[n] = 0;
+        while (*p == ' ') p++;
+        int ro = (p[0] == 'r' && p[1] == 'o');
+        int rc = vscsi_mount (id, path, ro != 0);
+        if (rc == 0) { cfg_set_vscsi (id, path, ro); cfg_save (); }
+        R.Format ("vscsi: mount ID %u %s: %s\r\n", id, path, rc == 0 ? "ok" : rc == -1 ? "bad id/path" : rc == -2 ? "cannot open" : "too small");
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'e')    // vse <id>: eject
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned id = parse_num (p);
+        int rc = vscsi_eject (id);
+        if (rc == 0) { cfg_set_vscsi (id, "", 0); cfg_save (); }
+        R.Format ("vscsi: eject ID %u: %s\r\n", id, rc == 0 ? "ok" : "bad id");
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'l')    // vsl [n]: the last n virtual SCSI commands (up to 512); vsl 0 clears
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned n = (*p >= '0' && *p <= '9') ? parse_num (p) : 64;
+        vscsi_log (n, R);
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'b')    // vsb <id> [MB]: FatFs/EMMC throughput on the mounted image (core 0, blocks the loop)
+    {
+        p += 3; while (*p == ' ') p++;
+        unsigned id = parse_num (p); while (*p == ' ') p++;
+        unsigned mb = parse_num (p);
+        vscsi_bench (id, mb, R);
+    }
+    else if (p[0] == 'v' && p[1] == 's' && p[2] == 'n')    // vsn <path> <MB>: new blank image
+    {
+        p += 3; while (*p == ' ') p++;
+        char path[128]; unsigned n = 0; while (*p && *p != ' ' && n < sizeof path - 1) path[n++] = *p++; path[n] = 0;
+        while (*p == ' ') p++;
+        unsigned mb = parse_num (p);
+        int rc = vscsi_new_image (path, mb);
+        R.Format ("vscsi: new %s %u MB: %s (%d)\r\n", path, mb, rc == 0 ? "ok" : "failed", rc);
+    }
     else if (p[0] == 'e' && p[1] == 's' && p[2] == 'c')    // esc [n]: last n CRTC scroll register writes: time, us since the last IACK (vector), HSYNC level at the write
     {
         p += 3;
@@ -2384,6 +2443,7 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
         emu_ensure ();
         emu_quiesce ();
         emu68k_reset ();
+        vscsi_on_reset ();                     // ejected virtual IDs go back to the real bus
         R = "emu reset\r\n";
     }
     else if (p[0] == 'e' && p[1] == 'r' && p[2] == 'n')    // ern <cycles>
