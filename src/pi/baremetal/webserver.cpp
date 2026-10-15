@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: MIT
 #include "webserver.h"
+#include "vscsi.h"
+#include "sdimg.h"
+#include "netfetch.h"
+#include "imgfs.h"
+#include "vscsi_js.h"
+#include <circle/net/socket.h>
 #include <circle/string.h>
 #include <circle/version.h>
 #include <circle/util.h>
@@ -95,6 +101,7 @@ static boolean wait_fd_idle (unsigned max_ms)
 // chunk plus form overhead; 64 KB lets /api/bus/dump hand the screen viewer
 // 32K words per request (a TVRAM plane's visible rows in one go)
 #define MAX_CONTENT_SIZE 65536
+#define MULTIPART_MAX    (512 * 1024 + 4096)
 
 volatile int g_WebAction = 0;
 
@@ -103,7 +110,8 @@ CVmpuWebServer::CVmpuWebServer (CNetSubSystem *pNetSubSystem, CSocket *pSocket)
     // connects without completing a request (browser preconnect, a dropped
     // Wi-Fi link) then holds its worker for good - after 10 of them the
     // listener refuses everything ("Too many clients") until a reboot
-    CHTTPDaemon (pNetSubSystem, pSocket, MAX_CONTENT_SIZE, HTTP_PORT, 0, 15),
+    // multipart buffer: /api/img/upload takes raw image data in 512 KB parts
+    CHTTPDaemon (pNetSubSystem, pSocket, MAX_CONTENT_SIZE, HTTP_PORT, MULTIPART_MAX, 15),
     m_pNet (pNetSubSystem)
 {
 }
@@ -248,6 +256,7 @@ THTTPStatus CVmpuWebServer::GetContent (const char *pPath, const char *pParams,
             if ((unsigned char) *p >= 0x20)
                 Name.Append (c);
         }
+        CString Ids; vscsi_status_json (Ids);      // "ids":[...] like vhd68
         char fsum[16] = "", fver[16] = "";
         if (!g_Update.busy)
         {
@@ -275,7 +284,7 @@ THTTPStatus CVmpuWebServer::GetContent (const char *pPath, const char *pParams,
                         "\"ipl\":%u,\"vpa\":%s,\"mock\":%s,\"board\":%d,\"firmware\":\"baremetal\","
                         "\"version\":\"" VMPU68_VERSION "\",\"pi_version\":\"" VMPU68_PI_VERSION "\",\"fpga_version\":\"%s\",\"build\":\"" VMPU68_BUILD "\",\"uptime\":%u,\"fpga_sum\":\"%s\",\"ram_mb\":%u,\"bus_mhz\":%u.%u,\"bus_class_min_mhz\":%u.%u,\"bus_class_source\":\"%s\",\"wr_ai\":%s,\"smi\":%s,\"wr_setup\":%u,\"wr_setup_auto\":%s,\"io_mhz\":%u,\"wait_ns\":%u,\"equiv_mhz\":%u.%u,\"mhz_limit\":%u,\"wb\":%s,\"jit\":%s,\"sramboot\":%s,\"hw\":\"%s\","
                         "\"bus_slow\":%s,\"out_delay\":%d,\"probe_ok\":%d,\"probe_lost\":[%u,%u,%u,%u,%u,%u,%u,%u],\"ab\":\"%s\",\"temp_c\":%u,\"throttled\":\"%08X\","
-                        "\"update\":{\"busy\":%s,\"phase\":\"%s\",\"done\":%u,\"total\":%u,\"msg\":\"%s\"}}",
+                        "\"update\":{\"busy\":%s,\"phase\":\"%s\",\"done\":%u,\"total\":%u,\"msg\":\"%s\"},%s}",
                         (const char *) Name, (const char *) Mac, st,
                         (st & VST_BUSY) ? "true" : "false",
                         (st & VST_FAULT) ? "true" : "false",
@@ -288,7 +297,7 @@ fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz1
                         setup_auto () ? "true" : "false", io_mhz_now (), vmpu68_get_wait_ns (), vmpu68_equiv_mhz10 () / 10, vmpu68_equiv_mhz10 () % 10, vmpu68_mhz_limit (), emu68k_wb_enabled () ? "true" : "false", jit_enabled () ? "true" : "false", cfg_sramboot () ? "true" : "false", vmpu68_hw_rev (),
                         hw_bus_slow () ? "true" : "false", hw_out_delay (), probe_ok (), probe_lost ()[0], probe_lost ()[1], probe_lost ()[2], probe_lost ()[3], probe_lost ()[4], probe_lost ()[5], probe_lost ()[6], probe_lost ()[7], vmpu68_ab_state (), vmpu68_pi_temp (), vmpu68_pi_throttled (),
                         g_Update.busy ? "true" : "false", g_Update.phase,
-                        g_Update.done, g_Update.total, g_Update.msg);
+                        g_Update.done, g_Update.total, g_Update.msg, (const char *) Ids);
         // circle's daemon has no header hook: ride the CORS header on the
         // content type so that the LAN finder page (file://) can read it
         *ppContentType = "application/json\r\nAccess-Control-Allow-Origin: *";
@@ -481,6 +490,16 @@ fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz1
             return HTTPOK;
         }
     }
+    else if (strcmp (pPath, "/vscsi.js") == 0)
+    {
+        unsigned n = sizeof s_VscsiJs - 1;
+        if (n > *pLength)
+            return HTTPInternalServerError;
+        memcpy (pBuffer, s_VscsiJs, n);
+        *pLength = n;
+        *ppContentType = "application/javascript; charset=utf-8";
+        return HTTPOK;
+    }
     else if (strcmp (pPath, "/screen.js") == 0)
     {
         unsigned n = sizeof s_ScreenJs - 1;
@@ -498,6 +517,7 @@ fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz1
             return HTTPBadRequest;
         unsigned off = param_num (pParams, "off", 0);
         unsigned last = param_num (pParams, "last", 0);
+        if (path[0] == '/') { char m[160]; sdimg_path (path, m, sizeof m); strncpy (path, m, sizeof path - 1); path[sizeof path - 1] = 0; }   // "/x.hds": image volume
 
         static u8 chunk[MAX_CONTENT_SIZE / 2];
         int n = form_hex_data (pFormData, chunk, sizeof chunk);
@@ -552,6 +572,177 @@ fver, CTimer::Get ()->GetUptime (), fsum, ram_mb (), bus_mhz10 () / 10, bus_mhz1
                         cfg_sramboot () ? "true" : "false", vmpu68_sramboot_state (), hw_smi () ? "true" : "false", vmpu68_board_id (), (const char *) N,
                         sbrc ? ",\"error\":\"SRAM write failed (X68000 off?)\"" : "",
                         smirc == -1 ? ",\"error\":\"SMI is only on core 2.x boards\"" : smirc ? ",\"error\":\"the FPGA did not answer through SMI\"" : "");
+    }
+    else if (strcmp (pPath, "/api/mount") == 0)    // /api/mount?slot=<0-6>&path=/vscsi/x.hds[&ro=1]: virtual SCSI (vhd68-compatible)
+    {
+        unsigned slot = param_num (pParams, "slot", 99); char path[128];
+        if (!param_str (pParams, "path", path, sizeof path)) path[0] = 0;
+        int rc = vscsi_mount (slot, path, param_num (pParams, "ro", 0) != 0);
+        if (rc == 0) { cfg_set_vscsi (slot, path, param_num (pParams, "ro", 0) != 0); cfg_save (); Content = "{\"ok\":true}"; }
+        else Content.Format ("{\"ok\":false,\"error\":\"%s\"}", rc == -1 ? "bad slot or path" : rc == -2 ? "cannot open image" : "image too small");
+    }
+    else if (strcmp (pPath, "/api/eject") == 0)    // /api/eject?slot=<0-6>
+    {
+        unsigned slot = param_num (pParams, "slot", 99);
+        int rc = vscsi_eject (slot);
+        if (rc == 0) { cfg_set_vscsi (slot, "", 0); cfg_save (); Content = "{\"ok\":true}"; }
+        else Content = "{\"ok\":false,\"error\":\"bad slot\"}";
+    }
+    else if (strcmp (pPath, "/api/img/new") == 0)  // /api/img/new?path=/vscsi/x.hds&mb=<n>: blank image (zeroed head, preallocated)
+    {
+        char path[128]; if (!param_str (pParams, "path", path, sizeof path)) path[0] = 0;
+        unsigned mb = param_num (pParams, "mb", 0); if (!mb) mb = (param_num (pParams, "bytes", 0) + 1048575) / 1048576;   // vhd68 passes bytes=
+        int rc = vscsi_new_image (path, mb);
+        if (rc == 0) Content = "{\"ok\":true}";
+        else Content.Format ("{\"ok\":false,\"error\":\"%s\"}", rc == -1 ? "path/mb required (1-4095)" : rc == -2 ? "already exists" : rc == -3 ? "cannot create" : rc == -4 ? "no room (needs contiguous space)" : "write failed");
+    }
+    else if (strcmp (pPath, "/api/file/put") == 0)     // POST multipart: /api/file/put?path=/x.hds&off=<bytes>&last=<0|1>[&t=<dos date<<16|time>], one raw part of up to 512 KB
+    {
+        char path[128];
+        if (!param_str (pParams, "path", path, sizeof path)) return HTTPBadRequest;
+        unsigned off = param_num (pParams, "off", 0), last = param_num (pParams, "last", 0);
+        if (path[0] == '/') { char m[160]; sdimg_path (path, m, sizeof m); strncpy (path, m, sizeof path - 1); path[sizeof path - 1] = 0; }
+        const char *hdr; const u8 *data = 0; unsigned n = 0;
+        if (!GetMultipartFormPart (&hdr, &data, &n)) { Content = "{\"ok\":false,\"error\":\"no multipart data\"}"; }
+        else
+        {
+            FIL f;
+            FRESULT fr = f_open (&f, path, off == 0 ? (FA_WRITE | FA_CREATE_ALWAYS) : (FA_WRITE | FA_OPEN_EXISTING));
+            if (fr == FR_OK && off > 0) fr = f_lseek (&f, off);
+            UINT bw = 0;
+            if (fr == FR_OK && n > 0) fr = f_write (&f, data, n, &bw);
+            if (fr == FR_OK && bw != n) fr = FR_DISK_ERR;
+            if (fr == FR_OK) fr = f_close (&f); else f_close (&f);
+            if (fr != FR_OK) Content.Format ("{\"ok\":false,\"error\":\"fatfs %d\"}", (int) fr);
+            else if (last) { FILINFO fi; unsigned t = param_num (pParams, "t", 0); if (t) { fi.fdate = (WORD) (t >> 16); fi.ftime = (WORD) t; f_utime (path, &fi); }
+                             unsigned size = f_stat (path, &fi) == FR_OK ? (unsigned) fi.fsize : 0; Content.Format ("{\"ok\":true,\"size\":%u}", size); }
+            else Content.Format ("{\"ok\":true,\"off\":%u,\"wrote\":%u}", off, n);
+        }
+    }
+    else if (strcmp (pPath, "/api/file") == 0)     // GET /api/file?path=/x.hds: the whole file, streamed (vhd68/vfd68 pull it with their /api/fetch)
+    {
+        char path[128];
+        if (!param_str (pParams, "path", path, sizeof path)) return HTTPBadRequest;
+        if (path[0] == '/') { char m[160]; sdimg_path (path, m, sizeof m); strncpy (path, m, sizeof path - 1); path[sizeof path - 1] = 0; }
+        FIL f;
+        if (f_open (&f, path, FA_READ) != FR_OK) return HTTPNotFound;
+        CSocket *s = GetSocket ();
+        u8 *buf = new u8[32768];
+        if (!s || !buf) { f_close (&f); delete [] buf; return HTTPInternalServerError; }
+        CString H; H.Format ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %u\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", (unsigned) f_size (&f));
+        boolean ok = s->Send ((const char *) H, H.GetLength (), 0) >= 0;
+        UINT n;
+        while (ok && f_read (&f, buf, 32768, &n) == FR_OK && n)
+        {
+            ok = s->Send (buf, n, 0) >= 0;
+            CScheduler::Get ()->Yield ();
+        }
+        f_close (&f); delete [] buf;
+        return HTTPResponseSent;                   // the daemon only closes the connection
+    }
+    else if (strcmp (pPath, "/api/ls") == 0)       // /api/ls?path=/sub: the image volume in vhd68's shape ({"dir","files":[{n,s,d}]}) for a peer's Web UI
+    {
+        char path[128]; if (!param_str (pParams, "path", path, sizeof path) && !param_str (pParams, "dir", path, sizeof path)) strcpy (path, "/");
+        sdimg_list_json (path, Content);
+        *ppContentType = "application/json\r\nAccess-Control-Allow-Origin: *";
+    }
+    else if (strcmp (pPath, "/api/fetch") == 0)    // GET: progress; POST ?ip=&port=&path=&dst=[&slot=]: pull http://ip:port<path> to dst on the image volume
+    {
+        char ip[24], path[256], dst[128], img[128], name[64];
+        boolean to_img = param_str (pParams, "img", img, sizeof img) && param_str (pParams, "name", name, sizeof name);
+        if (to_img) strcpy (dst, "/.__fetch.tmp");
+        if (param_str (pParams, "ip", ip, sizeof ip) && param_str (pParams, "path", path, sizeof path) && (to_img || param_str (pParams, "dst", dst, sizeof dst)))
+        {
+            int rc = netfetch_start (ip, param_num (pParams, "port", 80), path, dst, (int) param_num (pParams, "slot", 99) < 7 ? (int) param_num (pParams, "slot", 99) : -1,
+                                     to_img ? img : 0, to_img ? name : 0, param_num (pParams, "dir", 0), param_num (pParams, "t", 0));
+            Content = rc == 0 ? "{\"ok\":true}" : rc == -1 ? "{\"ok\":false,\"error\":\"a transfer is running\"}" : "{\"ok\":false,\"error\":\"ip, path (/...), dst (/...) required\"}";
+        }
+        else
+            netfetch_status_json (Content);
+        *ppContentType = "application/json\r\nAccess-Control-Allow-Origin: *";
+    }
+    else if (strcmp (pPath, "/api/file/get") == 0) // /api/file/get?path=/x.hds&off=<bytes>&len=<n, up to 60 KB>: raw bytes (the browser downloads in pieces)
+    {
+        char path[128];
+        if (!param_str (pParams, "path", path, sizeof path)) return HTTPBadRequest;
+        unsigned off = param_num (pParams, "off", 0), len = param_num (pParams, "len", 61440);
+        if (len > 61440) len = 61440;
+        if (path[0] == '/') { char m[160]; sdimg_path (path, m, sizeof m); strncpy (path, m, sizeof path - 1); path[sizeof path - 1] = 0; }
+        FIL f; UINT br = 0;
+        if (f_open (&f, path, FA_READ) != FR_OK) return HTTPNotFound;
+        FRESULT fr = f_lseek (&f, off);
+        if (fr == FR_OK) fr = f_read (&f, pBuffer, len, &br);
+        f_close (&f);
+        if (fr != FR_OK) return HTTPInternalServerError;
+        *pLength = br;
+        *ppContentType = "application/octet-stream";
+        return HTTPOK;
+    }
+    else if (strcmp (pPath, "/api/sd") == 0)       // SD card: boot partition, image volume, room for one
+    {
+        sdimg_info_json (Content);
+    }
+    else if (strcmp (pPath, "/api/sd/expand") == 0)   // POST: make the image volume on the rest of the card (and move SD:/vscsi/* there)
+    {
+        CString Err; int rc = sdimg_expand (Err);
+        if (rc == 0) Content = "{\"ok\":true}";
+        else Content.Format ("{\"ok\":false,\"error\":\"%s\"}", (const char *) Err);
+    }
+    else if (strcmp (pPath, "/api/file/rm") == 0 || strcmp (pPath, "/api/file/mkdir") == 0 || strcmp (pPath, "/api/file/rename") == 0)   // POST: files on the image volume
+    {
+        char path[128], to[128]; if (!param_str (pParams, "path", path, sizeof path)) path[0] = 0;
+        if (!param_str (pParams, "to", to, sizeof to)) to[0] = 0;
+        int rc = pPath[10] == 'r' && pPath[11] == 'm' ? sdimg_remove (path) : pPath[10] == 'm' ? sdimg_mkdir (path) : sdimg_rename (path, to);
+        if (rc == 0) Content = "{\"ok\":true}";
+        else Content.Format ("{\"ok\":false,\"error\":\"%s\"}", rc == -1 ? "path required" : rc == -2 ? "in use (mounted, or being transferred)" : "failed (exists, in use, or folder not empty)");
+    }
+    // ---- inside a disk image (vhd68's API: img/ls, get, inject, rm, mkdir, rename, move) ----
+    else if (strcmp (pPath, "/api/img/ls") == 0)   // /api/img/ls?path=/x.hds&clu=<dir cluster, 0 root>[&sz=<iso dir size>]
+    {
+        char path[128]; if (!param_str (pParams, "path", path, sizeof path)) path[0] = 0;
+        imgfs_ls (path, param_num (pParams, "clu", 0), param_num (pParams, "sz", 0), Content);
+        *ppContentType = "application/json\r\nAccess-Control-Allow-Origin: *";
+    }
+    else if (strcmp (pPath, "/api/img/get") == 0)  // /api/img/get?path=/x.hds&clu=&sz=&name=<raw Shift-JIS, %XX>: the file, streamed
+    {
+        char path[128], name[64]; const char *err = "";
+        if (!param_str (pParams, "path", path, sizeof path) || !param_str (pParams, "name", name, sizeof name)) return HTTPBadRequest;
+        u32 size = 0;
+        if (imgfs_get_open (path, param_num (pParams, "clu", 0), param_num (pParams, "sz", 0), name, &size, &err)) { Content.Format ("{\"ok\":false,\"error\":\"%s\"}", err); }
+        else
+        {
+            CSocket *s = GetSocket (); u8 *buf = new u8[32768];
+            if (!s || !buf) { imgfs_get_close (); delete [] buf; return HTTPInternalServerError; }
+            CString H; H.Format ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %u\r\nContent-Disposition: attachment; filename=\"%s\"\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", (unsigned) size, name);
+            boolean ok = s->Send ((const char *) H, H.GetLength (), 0) >= 0; int n;
+            while (ok && (n = imgfs_get_read (buf, 32768)) > 0) { ok = s->Send (buf, (unsigned) n, 0) >= 0; CScheduler::Get ()->Yield (); }
+            imgfs_get_close (); delete [] buf;
+            return HTTPResponseSent;
+        }
+    }
+    else if (strcmp (pPath, "/api/img/inject") == 0 || strcmp (pPath, "/api/img/rm") == 0 || strcmp (pPath, "/api/img/mkdir") == 0
+          || strcmp (pPath, "/api/img/rename") == 0 || strcmp (pPath, "/api/img/move") == 0)   // POST, img=&name=&dir= (+src/ow/t, to, from/to)
+    {
+        char img[128], name[64], src[128], to[64]; const char *err = "failed";
+        if (!param_str (pParams, "img", img, sizeof img) || !param_str (pParams, "name", name, sizeof name)) { Content = "{\"ok\":false,\"error\":\"img/name required\"}"; }
+        else
+        {
+            if (!param_str (pParams, "src", src, sizeof src)) src[0] = 0;
+            if (!param_str (pParams, "to", to, sizeof to)) to[0] = 0;
+            unsigned dir = param_num (pParams, "dir", 0), t = param_num (pParams, "t", 0); int rc;
+            switch (pPath[9])
+            {
+            case 'i': rc = imgfs_inject (img, src, name, dir, param_num (pParams, "ow", 0) != 0, t, &err); break;
+            case 'm': rc = pPath[10] == 'k' ? imgfs_mkdir (img, name, dir, t, &err) : imgfs_move (img, name, param_num (pParams, "from", 0), param_num (pParams, "to", 0), &err); break;
+            case 'r': rc = pPath[10] == 'm' ? imgfs_rm (img, name, dir, &err) : imgfs_rename (img, name, to, dir, &err); break;
+            default:  rc = -1;
+            }
+            if (rc == 0) Content = "{\"ok\":true}"; else Content.Format ("{\"ok\":false,\"error\":\"%s\"}", err);
+        }
+    }
+    else if (strcmp (pPath, "/api/img/newstat") == 0)   // vhd68 makes images in the background; ours is made in the call
+    {
+        Content = "{\"ok\":true,\"state\":\"idle\"}";
     }
     else if (strcmp (pPath, "/api/locate") == 0)   // /api/locate[?ms=10000]: blink every colour (vfd68/vhd68 style)
     {

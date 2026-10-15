@@ -8,7 +8,7 @@
 static const char s_UpdatePage[] = R"HTML(<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>vmpu68</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:0;background:#14161a;color:#e8e8e8}
+html{overflow-y:scroll}body{font-family:system-ui,sans-serif;margin:0;background:#14161a;color:#e8e8e8}
 header{padding:10px 16px;background:#20242c;display:flex;justify-content:space-between;align-items:baseline}
 header h1{font-size:18px;margin:0;color:#d8a8ff}
 #mock,small{font-size:12px;color:#9aa}
@@ -36,10 +36,23 @@ button.ico{margin:0;padding:5px 7px;line-height:0;display:inline-flex;align-item
 #proglog{font:12px/1.5 ui-monospace,monospace;color:#9aa;white-space:pre-wrap;max-height:160px;overflow:auto}
 .err{color:#ff7b72}.ok{color:#7ee787}
 #msg{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);background:#333c;padding:8px 16px;border-radius:6px;display:none;z-index:30}
+.tabs{display:flex;gap:6px;margin:14px 0 0}.tabs button{background:#20242c;color:#9aa;border-radius:8px 8px 0 0;padding:8px 18px;margin:0;font-size:14px}.tabs button.on{background:#31405a;color:#fff;font-weight:600}.tabs+div>.card:first-child,.tabs+div>div:first-child>.card{border-top-left-radius:0}
+#vsdev .row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;min-height:32px;border-bottom:1px solid #2a2f38;font-size:13px}#vsdev .row:last-child{border-bottom:0}#vsdev .idlabel{color:#7ec8ff;font-weight:600;display:inline-block;width:52px}
+#vsfiles div.row,#vspkbody .peer{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #2a2f38;font-size:13px}#vsfiles .fn{cursor:default;word-break:break-all}#vsfiles .dir{color:#7ec8ff;cursor:pointer}#vsfiles .dir:hover{text-decoration:underline}
+#vsfiles div.row>span:last-child{display:flex;flex-shrink:0;white-space:nowrap;align-items:center;margin-left:8px}#vsfiles .btns{display:inline-flex;justify-content:flex-end;min-width:196px;margin-left:12px}#vspath{font-size:13px;color:#cfc;margin-bottom:6px}
+#vsdrop{border:1px dashed #4a5568;border-radius:6px;padding:10px 12px;margin-top:10px}#vsdrop.drop{border-color:#7ec8ff;background:#26303e}#vsdrop .meta{margin:6px 0 0}small{color:#9aa}button.on{background:#2e6b34}button.on:hover{background:#388540}
+#ctxmenu{position:fixed;background:#2a3240;border:1px solid #45506a;border-radius:6px;padding:4px;z-index:26;box-shadow:0 4px 14px #0008}#ctxmenu button{display:block;width:100%;text-align:left;margin:1px 0;background:none}#ctxmenu button:hover{background:#3f5378}#ctxmenu button.warn:hover{background:#5a3131}
+.pickbox .idbtn{display:block;width:100%;text-align:left;margin:3px 0}.pickbox .name,.viewbox .name{font-size:14px;font-weight:600}
+#imgmodal .card{width:min(720px,94vw);max-height:88vh;overflow:auto;margin:0}#imgview div.row,#rbview div.row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #2a2f38;font-size:13px}#imgview .fn,#rbview .fn{cursor:default;word-break:break-all}#imgview .dir,#rbview .dir{color:#7ec8ff;cursor:pointer}#imgview .txt,#rbview .txt,#vsfiles .txt{cursor:pointer}#imgview .txt:hover,#rbview .txt:hover,#vsfiles .txt:hover{text-decoration:underline}#imgview div.row>span:last-child,#rbview div.row>span:last-child{display:flex;flex-shrink:0;white-space:nowrap;align-items:center;margin-left:8px}#imgdrop.drop{border-color:#7ec8ff;background:#26303e}
+.viewbox{background:#20242c;border-radius:8px;padding:14px;width:min(640px,92vw);max-height:80vh;display:flex;flex-direction:column}.viewbox pre,.viewbox textarea{flex:1;overflow:auto;overscroll-behavior:contain;background:#252b36;border:1px solid #3a4356;border-radius:6px;padding:8px;margin:8px 0;font:12px/1.5 ui-monospace,monospace;color:#e8e8e8;white-space:pre-wrap;word-break:break-all;min-height:200px}.viewbox textarea{resize:vertical;background:#14161a;border-color:#2a2f38}
+a.btn{display:inline-block;background:#31405a;color:#e8e8e8;border-radius:5px;padding:5px 10px;margin:2px 4px 2px 12px;font-size:13px;text-decoration:none}#ctxmenu a.btn{background:none;margin:1px 0}#ctxmenu a.btn:hover{background:#3f5378}#vspkbody .pl{cursor:pointer}#vspkbody .pl:hover{text-decoration:underline}
+#progbar2{height:10px;background:#14161a;border:1px solid #2a2f38;border-radius:5px;overflow:hidden;margin:10px 0 6px}#vsprogfill{height:100%;width:0;background:#7ec8ff;transition:width .3s}
 </style></head><body>
 <header><h1 id="ttl">vmpu68</h1><span id="mock"></span></header>
 <main>
 <div class="card"><h2>情報</h2><div id="info"></div></div>
+<div class="tabs"><button class="on" data-t="cpu" onclick="vsTab('cpu')">CPU</button><button data-t="scsi" onclick="vsTab('scsi')">仮想SCSI</button></div>
+<div id="tab-cpu">
 <div style="display:flex;gap:10px;align-items:stretch;flex-wrap:wrap">
 <div class="card" style="flex:1 1 400px;margin:10px 0 0"><h2>MPU 設定</h2>
 <div class="segrow"><span class="lbl">速度</span><span class="seg" id="segspd"><button data-v="10" onclick="cfgSet('mhz',10)">10 MHz 相当</button><button data-v="16" onclick="cfgSet('mhz',16)">16 MHz 相当</button><button data-v="24" onclick="cfgSet('mhz',24)">24 MHz 相当</button><button data-v="0" id="segmax" onclick="cfgSet('mhz',0)">Max</button></span></div>
@@ -66,10 +79,31 @@ button.ico{margin:0;padding:5px 7px;line-height:0;display:inline-flex;align-item
 <label class="chk" style="display:block;margin:6px 0 0"><input type="checkbox" id="force"> 上書き更新 (同じバージョンでも書き換える)</label>
 <label class="chk" style="display:block;margin:4px 0 0"><input type="checkbox" id="trymode" checked> お試し起動 (問題なく20秒動けば確定、そうでなければ前のバージョンに戻す)</label></p>
 </div>
+</div>
+<div id="tab-scsi" style="display:none">
+<div class="card"><h2>SCSI デバイス</h2><div id="vsdev"></div><div class="meta">vmpu68 が X68000 の内蔵 SCSI/SASI の代わりに処理する仮想 SCSI/SASI デバイスです。イメージをマウントすると内蔵 SCSI/SASI デバイスより優先されます。</div></div>
+<div class="card">
+<h2 style="display:flex;justify-content:space-between;align-items:center">SDカード <label style="font-size:.75rem;font-weight:normal;color:#9aa"><input type="checkbox" id="vsshowall" onchange="vsLs()"> すべて表示</label></h2>
+<div id="vssd" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px;margin-bottom:8px">...</div>
+<div id="vspath"></div>
+<div id="vsfiles"></div>
+<div style="display:flex;gap:10px;align-items:center">
+<div id="vsdrop" style="flex:1">
+<input type="file" id="vsup"> <button onclick="vsUpload()">アップロード</button>
+<div class="meta">ここにファイルをドロップしてもアップロードできます</div>
+</div>
+<span style="display:flex;flex-direction:column;gap:6px;margin-top:10px"><button onclick="vsNewDlg()" style="white-space:nowrap;margin:0">イメージ作成</button><button onclick="vsLan()" style="white-space:nowrap;margin:0">LAN連携</button><button onclick="vsMkdir()" style="white-space:nowrap;margin:0">フォルダ作成</button></span>
+</div>
+<div class="meta" id="vsupinfo"></div></div>
+</div>
 <div class="card"><h2 style="display:flex;justify-content:space-between;align-items:center">近くの機器 <button onclick="scan()" id="sc" class="ico" title="再スキャン (同じ /24 を HTTP で探す)" aria-label="再スキャン"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><polyline points="20 3 20 9 14 9"/></svg></button></h2>
 <div id="peers"><span class="meta">...</span></div></div>
 </main>
 <div id="msg"></div>
+<div id="ctxmenu" style="display:none"></div>
+<div id="vsmodal" style="position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:25"></div>
+<div id="imgmodal" style="position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:18"><div class="card" id="imgview"></div></div>
+<div id="vsprog" style="position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:27"><div class="pickbox"><h2 style="font-size:14px;margin:0;color:#9fd49f" id="vsprogttl">インポート</h2><div class="name" id="vsprogname" style="margin:6px 0"></div><div id="progbar2"><div id="vsprogfill"></div></div><div class="meta" id="vsprogtext"></div></div></div>
 <div id="namemodal" style="position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:25"><div class="pickbox"><div style="display:flex;justify-content:space-between;align-items:center"><h2 style="font-size:14px;margin:0;color:#9fd49f">ホスト名を設定</h2><button class="x" onclick="nameHide()">&times;</button></div>
 <div class="meta" style="margin:8px 0 4px">Web UI のヘッダと、近くの機器(vhd68/vfd68)の一覧に表示される名前です。31 バイトまで(日本語は 1 文字 3 バイト)。</div>
 <input type="text" id="namein" maxlength="31" placeholder="X68000" style="width:100%;box-sizing:border-box" onkeydown="if(event.key==='Enter')nameSave();if(event.key==='Escape')nameHide()">
@@ -159,5 +193,5 @@ async function scan(){if(scanning)return;const base=location.hostname.split(".")
   n++;$("#sc").textContent=`スキャン中 ${n}/253`}};
  await Promise.all(Array.from({length:24},w));scanning=false;$("#sc").innerHTML=SC_ICON}
 </script><script>// screen.js is fetched with a fresh query string so a browser never keeps an old copy across firmware updates
-(()=>{const s=document.createElement("script");s.src="/screen.js?"+Date.now();document.body.appendChild(s)})();</script></body></html>
+(()=>{for(const f of["/screen.js","/vscsi.js"]){const s=document.createElement("script");s.src=f+"?"+Date.now();document.body.appendChild(s)}})();</script></body></html>
 )HTML";

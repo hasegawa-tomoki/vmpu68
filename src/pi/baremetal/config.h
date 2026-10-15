@@ -31,6 +31,9 @@ void cfg_set (unsigned mhz, unsigned wb, unsigned jit);   // change the runtime 
 void cfg_set_name (const char *v);      // display name (31 bytes max; persisted by cfg_save())
 void cfg_set_ram (unsigned mb);         // ram=<MB> fixed main RAM size, 0 = probe; takes effect at the next boot
 int  cfg_save (void);                   // rewrite SD:/vmpu68.cfg with the known keys; 0 = ok
+// vscsi<id>=<path>[,ro]: virtual SCSI image mounted at boot on ID 0-6 (SD root relative, e.g. /vscsi/a.hds)
+const char *cfg_vscsi (unsigned id, int *ro);   // "" when not configured
+void cfg_set_vscsi (unsigned id, const char *path, int ro);   // path "" = remove; persisted by cfg_save()
 
 // SD:/vmpu68-bus.json — bus timing per bus-clock class.  {"bus":[{...},...]}
 // with min_mhz (the class applies from this clock upward, 0.1 MHz steps),

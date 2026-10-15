@@ -452,6 +452,284 @@ uint32_t emu68k_info_wlog(uint32_t back, uint32_t *entry)
     return info_wlog_n;
 }
 
+/* Virtual SCSI command port, $ECD100-$ECD1FF (docs/design/vscsi-plan.md).
+ * The X68000 side (the replacement _SCSIDRV handler) fills in a CDB, the
+ * target ID, the data direction, a buffer address and a length, then writes
+ * 1 to +$18.  A worker on another Pi core executes the command against the
+ * virtual targets (emu68k_vscsi_take / emu68k_vscsi_done) while the 68000
+ * polls +$18 with interrupts enabled.  All 68000-memory traffic stays on the
+ * emulator core: data-out is captured into the bounce buffer when the command
+ * starts, data-in is committed from it when the 68000 reads +$18 and finds
+ * the command finished.  Register map (big-endian):
+ *   +$00..$0B CDB   +$0C id   +$0D dir (0 none, 1 in, 2 out)   +$10 buffer
+ *   +$14 length     +$18 w: 1 = start; r: bit0 busy, bit1 done, bit2 error,
+ *   bits 15:8 SCSI status byte   +$1A result (0 ok, -1 no target, -2 bad request)
+ *   +$1C residual   +$20 'VSCS'   +$24 port version   +$26 max transfer (KB)
+ *   +$28 commands so far
+ *   +$0E connection state kept for the X68000 handler (0 idle, 1 selected,
+ *        2 CDB loaded, 3 executed)   +$2C hook address (the SRAM-resident
+ *   _SCSIDRV handler writes it at install)   +$30 the previous _SCSIDRV
+ *   vector (written at install, updated by the vector keeper below, read
+ *   by the handler to chain)   +$34 r: mask of IDs the Pi serves (bit n =
+ *   ID n)   +$36 w: 1 = the X68000 saw S_RESET (logged)
+ * Vector keeper: once a hook address is known, every write to the IOCS
+ * vector $F5 ($7D4) that installs something else (the disk-resident SHARP
+ * driver brings its own SCSI IOCS) is undone: the new value becomes the
+ * chained vector and the hook goes back in, so the Pi's IDs stay visible. */
+static uint32_t watch_addr, watch_end, watch_addr2, watch_end2;   /* defined below (watch ranges) */
+static inline int watch_hit(uint32_t a);
+static void vs_put_block(uint32_t a, const uint8_t *src, uint32_t n);
+static void vs_get_block(uint32_t a, uint8_t *dst, uint32_t n);
+#define VSCSI_BASE   0xECD100u
+#define VSCSI_BUFSZ  (256u * 1024u)
+#define VSCSI_VER    1
+enum { VS_IDLE = 0, VS_BUSY = 1, VS_PENDING = 2, VS_DONE = 3 };
+static uint8_t  vs_regs[0x20];
+static uint8_t *vs_buf;
+static volatile uint32_t vs_state;       /* VS_* ; written by both cores with release/acquire */
+static uint32_t vs_taken;                /* worker side: the BUSY request was handed out */
+static uint32_t vs_gen;                  /* bumped by reset: a completion for an old generation is dropped */
+static emu68k_vscsi_req_t vs_req;
+static unsigned vs_status; static uint32_t vs_resid; static int vs_err;
+static uint32_t vs_count, vs_overrun, vs_toolong, vs_fast, vs_slow;   /* block chunks by path */
+static uint32_t vs_hook_addr, vs_old_vec, vs_mask, vs_keeper_n, vs_reset_n;
+static uint32_t vs_old_prev;        /* +$30 guard: a write that would make the old vector the hook itself is undone */
+static uint16_t vs_last_id;         /* +$3C: ID of the last command (VMPU68.X -d probes a drive and reads this) */
+static uint16_t vs_cmd_cnt[8], vs_chain_cnt[8];   /* +$68..: chained (real bus) calls per ID, +$78..: virtual commands per ID */
+/* +$40 label request/state, +$42 index, +$48..+$67 the label: "who is at SCSI ID 0-7 / FDD unit 0-3" from the
+   Pi's view of the LAN (vhd68 / vfd68 status) and its own virtual disks.  VMPU68.X -d asks (writes 1 to +$40),
+   core 0 fills the table and sets the state to 2. */
+#define VS_LABELS 12
+static char     vs_label[VS_LABELS][32];
+static volatile int vs_label_state;   /* 0 idle, 1 requested, 2 ready */
+static unsigned vs_label_idx;
+static int      vs_in_keeper;
+static uint32_t vs_trace[64], vs_trace_n, vs_trace_tag;   /* calls the X68000 hook passed on: {d1<<16 | d4&FFFF} */
+static uint64_t vs_t_start, vs_t_done, vs_t_commit;   /* ticks: last command */
+static uint64_t vs_sum_busy, vs_sum_commit;
+static inline int vs_hit(uint32_t a) { return (a & 0xFFFFFF00u) == VSCSI_BASE; }
+static uint32_t vs_get32(unsigned o) { return ((uint32_t)vs_regs[o] << 24) | ((uint32_t)vs_regs[o + 1] << 16) | ((uint32_t)vs_regs[o + 2] << 8) | vs_regs[o + 3]; }
+static void vs_start(void)
+{
+    uint32_t st = __atomic_load_n(&vs_state, __ATOMIC_ACQUIRE);
+    if (st == VS_BUSY || st == VS_PENDING) { vs_overrun++; return; }
+    if (!vs_buf) vs_buf = malloc(VSCSI_BUFSZ);
+    if (!vs_buf) { vs_err = -2; vs_status = 0; vs_resid = 0; __atomic_store_n(&vs_state, VS_DONE, __ATOMIC_RELEASE); return; }
+    memcpy(vs_req.cdb, vs_regs, 12);
+    vs_req.id = vs_regs[0x0C] & 7; vs_req.dir = vs_regs[0x0D];
+    vs_req.addr = vs_get32(0x10) & (ADDR_SPACE - 1);
+    vs_req.len = vs_get32(0x14);
+    vs_last_id = vs_req.id;
+    vs_cmd_cnt[vs_req.id & 7]++;
+    vs_req.gen = vs_gen;
+    if (vs_req.len > VSCSI_BUFSZ) { vs_toolong++; vs_err = -2; vs_status = 0; vs_resid = vs_req.len; __atomic_store_n(&vs_state, VS_DONE, __ATOMIC_RELEASE); return; }
+    if (vs_req.dir == 2) {                      /* data-out: capture now, on the emulator core */
+        if (vs_req.addr + vs_req.len <= ADDR_SPACE) vs_get_block(vs_req.addr, vs_buf, vs_req.len);
+        else { vs_err = -2; vs_status = 0; vs_resid = vs_req.len; __atomic_store_n(&vs_state, VS_DONE, __ATOMIC_RELEASE); return; }
+    }
+    vs_count++;
+    vs_t_start = vmpu68_ticks();
+    __atomic_store_n(&vs_taken, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&vs_state, VS_BUSY, __ATOMIC_RELEASE);
+}
+/* block copy between the bounce buffer and 68000 memory.  Main-RAM pages
+ * under write-back (and local memory) take a memcpy: dirty bits are set
+ * for the words, JIT code marks in the range are honoured, a watch range
+ * drops back to the per-word path.  Everything else (bus pages, SRAM/ROM,
+ * write-through) goes word by word through the normal access functions. */
+static void vs_put_block(uint32_t a, const uint8_t *src, uint32_t n)
+{
+    while (n) {
+        uint32_t chunk = PAGE_SIZE - (a & (PAGE_SIZE - 1));
+        if (chunk > n) chunk = n;
+        unsigned m = map[a >> PAGE_SHIFT];
+        int fast = (m == MAP_LOCAL || (m == MAP_SHADOW && (!wthrough || (wb_on && !page_wt(a)))))
+                   && !(a & 1) && !(chunk & 1)
+                   && !(watch_hit(a) || watch_hit(a + chunk - 2) || (watch_addr >= a && watch_addr < a + chunk) || (watch_addr2 >= a && watch_addr2 < a + chunk));
+        if (fast) {
+            vs_fast++;
+            memcpy(shadow + a, src, chunk);
+            for (uint32_t g = a >> 5; g <= (a + chunk - 1) >> 5; g++)
+                if (jit_code_map[g & 0x7FFFF]) jit_note_write(g << 5, 32);
+            if (m == MAP_SHADOW && wthrough) {
+                uint32_t w = a, e = a + chunk;
+                for (; w < e && (w & 15); w += 2) dirty_set(w);
+                for (; w + 16 <= e; w += 16) __atomic_fetch_or(&dirty[w >> 4], (uint8_t)0xFF, __ATOMIC_RELAXED);
+                for (; w < e; w += 2) dirty_set(w);
+                wb_stat.wb_writes += chunk / 2;
+            }
+        } else {
+            vs_slow++;
+            uint32_t x = a, k = chunk, i = 0;
+            if (k && (x & 1)) { m68k_write_memory_8(x, src[i++]); x++; k--; }
+            for (; k >= 2; x += 2, k -= 2, i += 2) m68k_write_memory_16(x, ((unsigned)src[i] << 8) | src[i + 1]);
+            if (k) m68k_write_memory_8(x, src[i]);
+        }
+        a += chunk; src += chunk; n -= chunk;
+    }
+}
+static void vs_get_block(uint32_t a, uint8_t *dst, uint32_t n)
+{
+    while (n) {
+        uint32_t chunk = PAGE_SIZE - (a & (PAGE_SIZE - 1));
+        if (chunk > n) chunk = n;
+        unsigned m = map[a >> PAGE_SHIFT];
+        int fast = (m == MAP_SHADOW || m == MAP_LOCAL || ((m == MAP_ROM || m == MAP_SRAM) && rom_valid[a >> PAGE_SHIFT]))
+                   && !(watch_hit(a) || watch_hit(a + chunk - 1) || (watch_addr >= a && watch_addr < a + chunk) || (watch_addr2 >= a && watch_addr2 < a + chunk));
+        if (fast) { vs_fast++; memcpy(dst, shadow + a, chunk); }
+        else {
+            vs_slow++;
+            uint32_t x = a, k = chunk, i = 0;
+            if (k && (x & 1)) { dst[i++] = (uint8_t)m68k_read_memory_8(x); x++; k--; }
+            for (; k >= 2; x += 2, k -= 2, i += 2) { unsigned w = m68k_read_memory_16(x); dst[i] = (uint8_t)(w >> 8); dst[i + 1] = (uint8_t)w; }
+            if (k) dst[i] = (uint8_t)m68k_read_memory_8(x);
+        }
+        a += chunk; dst += chunk; n -= chunk;
+    }
+}
+static void vs_commit(void)                     /* emulator core: the worker finished, land data-in */
+{
+    uint64_t t0 = vmpu68_ticks();
+    if (vs_req.dir == 1 && vs_err == 0) {
+        uint32_t n = vs_req.len > vs_resid ? vs_req.len - vs_resid : 0;
+        if (vs_req.addr + n <= ADDR_SPACE) vs_put_block(vs_req.addr, vs_buf, n);
+    }
+    vs_t_commit = vmpu68_ticks();
+    vs_sum_commit += vs_t_commit - t0;
+    __atomic_store_n(&vs_state, VS_DONE, __ATOMIC_RELEASE);
+}
+static uint16_t vs_read16(uint32_t a)
+{
+    unsigned o = a & 0xFE;
+    if (o >= 0x68 && o < 0x78) return vs_chain_cnt[(o - 0x68) >> 1];
+    if (o >= 0x78 && o < 0x88) return vs_cmd_cnt[(o - 0x78) >> 1];
+    if (o >= 0x48 && o < 0x68) {                   /* label window */
+        const char *l = vs_label[vs_label_idx < VS_LABELS ? vs_label_idx : 0];
+        return (uint16_t)(((uint8_t)l[o - 0x48] << 8) | (uint8_t)l[o - 0x48 + 1]);
+    }
+    switch (o) {
+    case 0x18: {
+        uint32_t st = __atomic_load_n(&vs_state, __ATOMIC_ACQUIRE);
+        if (st == VS_PENDING) { vs_commit(); st = VS_DONE; }
+        unsigned v = (st == VS_BUSY) ? 1 : 0;
+        if (st == VS_DONE) v |= 2 | (vs_err ? 4 : 0) | ((vs_status & 0xFF) << 8);
+        return (uint16_t)v;
+    }
+    case 0x1A: return (uint16_t)vs_err;
+    case 0x1C: return (uint16_t)(vs_resid >> 16);
+    case 0x1E: return (uint16_t)vs_resid;
+    case 0x20: return 0x5653;                   /* 'VS' */
+    case 0x22: return 0x4353;                   /* 'CS' */
+    case 0x24: return VSCSI_VER;
+    case 0x26: return VSCSI_BUFSZ / 1024;
+    case 0x28: return (uint16_t)(vs_count >> 16);
+    case 0x2A: return (uint16_t)vs_count;
+    case 0x2C: return (uint16_t)(vs_hook_addr >> 16);
+    case 0x2E: return (uint16_t)vs_hook_addr;
+    case 0x30: return (uint16_t)(vs_old_vec >> 16);
+    case 0x32: return (uint16_t)vs_old_vec;
+    case 0x34: return (uint16_t)vs_mask;
+    case 0x3C: return vs_last_id;
+    case 0x3E: return (uint16_t)vs_trace_n;        /* chained (real bus) calls so far */
+    case 0x40: return (uint16_t)vs_label_state;
+    case 0x42: return (uint16_t)vs_label_idx;
+    default:
+        if (o < 0x18) return (uint16_t)(((unsigned)vs_regs[o] << 8) | vs_regs[o + 1]);
+        return 0;
+    }
+}
+static void vs_write16(uint32_t a, uint16_t v, int byte)
+{
+    unsigned o = a & 0xFF;
+    if (o < 0x18) {
+        if (byte) vs_regs[o] = (uint8_t)v;
+        else { vs_regs[o & 0xFE] = (uint8_t)(v >> 8); vs_regs[(o & 0xFE) + 1] = (uint8_t)v; }
+        return;
+    }
+    if ((o & 0xFE) == 0x18 && (v & 1)) { vs_start(); return; }
+    switch (o & 0xFE) {
+    case 0x2C: vs_hook_addr = (vs_hook_addr & 0x0000FFFFu) | ((uint32_t)v << 16); break;
+    case 0x2E: vs_hook_addr = (vs_hook_addr & 0xFFFF0000u) | v; break;
+    case 0x30: vs_old_prev = vs_old_vec; vs_old_vec = (vs_old_vec & 0x0000FFFFu) | ((uint32_t)v << 16); break;
+    case 0x32: vs_old_vec = (vs_old_vec & 0xFFFF0000u) | v;
+               if (vs_hook_addr && vs_old_vec == vs_hook_addr) vs_old_vec = vs_old_prev;   /* chaining to ourselves would loop forever */
+               break;
+    case 0x36: vs_reset_n++; break;
+    case 0x38: vs_trace[vs_trace_n & 63] = ((uint32_t)v << 16) | vs_trace_tag; vs_trace_n++; break;   /* chained call: d1 (written last) */
+    case 0x3A: vs_trace_tag = v; vs_chain_cnt[v & 7]++; break;                                       /* ... d4 low word (written first) */
+    case 0x44: if (vs_trace_n) vs_trace[(vs_trace_n - 1) & 63] |= ((uint32_t)v & 0xFFF) << 4; break;   /* chained call came back: d0 low 12 bits */
+    case 0x40: if (vs_label_state != 1) vs_label_state = v ? 1 : 0; break;   /* 1: please refresh the labels */
+    case 0x42: vs_label_idx = v % VS_LABELS; break;
+    default: break;
+    }
+}
+/* the IOCS $F5 vector ($7D4) was written: keep the hook at the head */
+static void vs_vector_written(uint32_t a)
+{
+    if (!vs_hook_addr || vs_in_keeper || (a & ~3u) != 0x7D4) return;
+    if (!((a & 3) == 2 || (a & 3) == 3)) return;     /* act when the low word (or its low byte) lands */
+    uint32_t v = ((uint32_t)shadow[0x7D4] << 24) | ((uint32_t)shadow[0x7D5] << 16) | ((uint32_t)shadow[0x7D6] << 8) | shadow[0x7D7];
+    if (v == vs_hook_addr || v == 0) return;
+    vs_old_vec = v;
+    vs_keeper_n++;
+    vs_in_keeper = 1;
+    m68k_write_memory_16(0x7D4, vs_hook_addr >> 16);
+    m68k_write_memory_16(0x7D6, vs_hook_addr & 0xFFFF);
+    vs_in_keeper = 0;
+}
+void emu68k_vscsi_set_mask(unsigned mask) { vs_mask = mask & 0x7F; }
+int  emu68k_vscsi_label_requested(void) { return vs_label_state == 1; }
+void emu68k_vscsi_set_label(unsigned i, const char *s)
+{
+    if (i >= VS_LABELS) return;
+    unsigned k = 0; for (; s && s[k] && k < 31; k++) vs_label[i][k] = s[k];
+    for (; k < 32; k++) vs_label[i][k] = 0;
+}
+void emu68k_vscsi_labels_ready(void) { vs_label_state = 2; }
+unsigned emu68k_vscsi_trace(uint32_t *out, unsigned max)   /* newest last; returns count copied */
+{
+    unsigned n = vs_trace_n < 64 ? vs_trace_n : 64; if (n > max) n = max;
+    for (unsigned i = 0; i < n; i++) out[i] = vs_trace[(vs_trace_n - n + i) & 63];
+    return n;
+}
+unsigned emu68k_vscsi_hook_info(uint32_t *hook, uint32_t *oldv, uint32_t *kept, uint32_t *resets)
+{
+    if (hook) *hook = vs_hook_addr; if (oldv) *oldv = vs_old_vec; if (kept) *kept = vs_keeper_n; if (resets) *resets = vs_reset_n;
+    return vs_mask;
+}
+int emu68k_vscsi_take(emu68k_vscsi_req_t *r, uint8_t **buf, uint32_t *bufsize)
+{
+    if (__atomic_load_n(&vs_state, __ATOMIC_ACQUIRE) != VS_BUSY) return 0;
+    if (__atomic_load_n(&vs_taken, __ATOMIC_RELAXED)) return 0;
+    __atomic_store_n(&vs_taken, 1, __ATOMIC_RELAXED);
+    *r = vs_req; *buf = vs_buf; *bufsize = VSCSI_BUFSZ;
+    return 1;
+}
+void emu68k_vscsi_done(uint32_t gen, unsigned status, uint32_t resid, int err)
+{
+    if (gen != vs_gen || __atomic_load_n(&vs_state, __ATOMIC_ACQUIRE) != VS_BUSY) return;   /* reset in between */
+    vs_status = status; vs_resid = resid; vs_err = err;
+    vs_t_done = vmpu68_ticks();
+    vs_sum_busy += vs_t_done - vs_t_start;
+    __atomic_store_n(&vs_state, VS_PENDING, __ATOMIC_RELEASE);
+}
+void emu68k_vscsi_stats(emu68k_vscsi_stats_t *s)
+{
+    s->count = vs_count; s->overrun = vs_overrun; s->toolong = vs_toolong; s->state = vs_state; s->fast = vs_fast; s->slow = vs_slow;
+    uint64_t hz = vmpu68_tick_hz(); if (!hz) hz = 1;
+    s->last_busy_us = (uint32_t)((vs_t_done - vs_t_start) * 1000000ull / hz);
+    s->last_commit_us = (uint32_t)((vs_t_commit - vs_t_done) * 1000000ull / hz);
+    s->avg_busy_us = vs_count ? (uint32_t)(vs_sum_busy * 1000000ull / hz / vs_count) : 0;
+    s->avg_commit_us = vs_count ? (uint32_t)(vs_sum_commit * 1000000ull / hz / vs_count) : 0;
+}
+static void vs_reset(void)
+{
+    vs_gen++;
+    __atomic_store_n(&vs_state, VS_IDLE, __ATOMIC_RELEASE);
+    memset(vs_regs, 0, sizeof vs_regs);
+    vs_hook_addr = 0; vs_old_vec = 0;
+}
+
 static void rom_fill(uint32_t page)
 {
     uint32_t base = page << PAGE_SHIFT;
@@ -1133,6 +1411,7 @@ unsigned int m68k_read_memory_8(unsigned int a)
         emu68k_prof_acc[1]++;
         { uint8_t jv; if (joy_hit(a, &jv)) return jv; }
         if (info_hit(a)) { uint16_t w = info_read16(a); return (a & 1) ? (w & 0xFF) : (w >> 8); }
+        if (vs_hit(a)) { uint16_t w = vs_read16(a); return (a & 1) ? (w & 0xFF) : (w >> 8); }
         if (xt30_hit(a)) return (a & 1) ? (xt30_ctl & 0xFF) : (xt30_ctl >> 8);
         int io = io_range(a);
         if (io) { fdc_touch(a); io_wait(0); }
@@ -1165,6 +1444,7 @@ unsigned int m68k_read_memory_16(unsigned int a)
         uint16_t v = 0;
         emu68k_prof_acc[1]++;
         if (info_hit(a)) return info_read16(a);
+        if (vs_hit(a)) return vs_read16(a);
         if (xt30_hit(a)) return xt30_ctl;
         int io = io_range(a);
         if (io) { fdc_touch(a); io_wait(0); }
@@ -1253,6 +1533,7 @@ void m68k_write_memory_8(unsigned int a, unsigned int v)
         if (watch_hit(a)) watch_log(a, v, 1, 0);
         shadow[a] = (uint8_t)v;
         if (jit_code_hit(a, 1)) jit_note_write(a, 1);
+        if ((a & ~3u) == 0x7D4) vs_vector_written(a);
         if (!wthrough) return;
         if (wb_on && !page_wt(a)) { dirty_set(a); wb_stat.wb_writes++; wb_slow(); return; }
         wb_stat.wt_writes++;
@@ -1269,6 +1550,7 @@ void m68k_write_memory_8(unsigned int a, unsigned int v)
         break;
     default:
         if (info_hit(a)) { info_write16(a, (uint16_t)(v & 0xFF)); return; }
+        if (vs_hit(a)) { vs_write16(a, (uint16_t)(v & 0xFF), 1); return; }
         if (xt30_hit(a)) {
             xt30_write((a & 1) ? ((xt30_ctl & 0xFF00) | (v & 0xFF))
                                : ((xt30_ctl & 0xFF) | ((v & 0xFF) << 8)));
@@ -1291,6 +1573,7 @@ void m68k_write_memory_16(unsigned int a, unsigned int v)
         shadow[a] = (uint8_t)(v >> 8);
         shadow[a + 1] = (uint8_t)v;
         if (jit_code_hit(a, 2)) jit_note_write(a, 2);
+        if ((a & ~3u) == 0x7D4) vs_vector_written(a);
         if (!wthrough) return;
         if (wb_on && !page_wt(a)) { dirty_set(a); wb_stat.wb_writes++; wb_slow(); return; }
         wb_stat.wt_writes++;
@@ -1308,6 +1591,7 @@ void m68k_write_memory_16(unsigned int a, unsigned int v)
         break;
     default:
         if (info_hit(a)) { info_write16(a, (uint16_t)v); return; }
+        if (vs_hit(a)) { vs_write16(a, (uint16_t)v, 0); return; }
         if (xt30_hit(a)) { xt30_write(v & 0xFFFF); return; }
         break;
     }
@@ -1553,6 +1837,7 @@ void emu68k_reset(void)
 {
     jit_flush_all();
     in_fault = 0;
+    vs_reset();
     /* behave like the X68000 reset button: hold RESET+HALT for 100ms so
      * every peripheral (SCC, SPC, DMAC...) restarts from a clean state */
     hw_set_drv(1, 1);
@@ -1797,6 +2082,18 @@ int emu68k_poke16(uint32_t a, unsigned v)
     if (!wthrough) return 0;
     if (wb_on && dirty) { dirty_set(a); return 0; }
     return (hw_bus_write(a, 1, (uint16_t)v) & VST_FAULT) ? -1 : 0;
+}
+
+/* Power-on: the machine's RAM holds nothing worth reading (12 MB over the
+ * bus took 4.4 s on core 2.1), so start from zeros instead.  Regions the CPU
+ * never writes then differ from the real RAM, which only a DMA read of an
+ * uninitialised buffer could notice - garbage either way. */
+void emu68k_shadow_clear(void)
+{
+    jit_flush_all();
+    memset(shadow, 0, ram_size);
+    if (dirty) memset(dirty, 0, ADDR_SPACE / 16);
+    memset(wt_until, 0, sizeof wt_until);
 }
 
 int emu68k_sync_shadow(uint32_t from, uint32_t len)

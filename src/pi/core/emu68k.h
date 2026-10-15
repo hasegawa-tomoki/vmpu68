@@ -94,6 +94,7 @@ uint32_t emu68k_wbrk_pc(void);   /* PC of the write that tripped the write-break
 int  emu68k_brk_hit(void);      /* 1 once the PC breakpoint fired (kernel stops the core; ebrk re-arms) */
 unsigned emu68k_peek16(uint32_t a);   /* emulator-visible word (fills ROM cache) */            /* 1 after the crash breakpoint fired */
 int  emu68k_sync_shadow(uint32_t from, uint32_t len);  /* bus -> shadow */
+void emu68k_shadow_clear(void);                        /* power-on: zero the shadow instead of reading garbage RAM */
 /* write-back main RAM (docs 31): CPU writes stay in the shadow until a DMAC channel start needs them */
 int  emu68k_wb_enabled(void);
 void emu68k_wb_set(int on);            /* off: writes back everything dirty, then write-through as before */
@@ -152,5 +153,21 @@ int emu68k_prof_on(void);
 const uint32_t *emu68k_prof_ops(void);       /* 65536 per-opcode counts (NULL until first enabled) */
 const uint32_t *emu68k_prof_blocks(uint64_t *instr, uint64_t *blocks);   /* 64 bins of instructions per basic block */
 extern uint32_t emu68k_prof_acc[4];          /* reads shadow/other, writes shadow/other */
+
+/* virtual SCSI command port $ECD100 (docs/design/vscsi-plan.md): a worker on
+ * another core takes a request (data-out already in buf), executes it and
+ * reports back; the emulator core lands data-in when the 68000 polls */
+typedef struct { uint8_t cdb[12]; uint8_t id, dir; uint32_t addr, len, gen; } emu68k_vscsi_req_t;
+typedef struct { uint32_t count, overrun, toolong, state, last_busy_us, last_commit_us, avg_busy_us, avg_commit_us, fast, slow; } emu68k_vscsi_stats_t;   /* fast/slow: block chunks by memcpy / per word */
+int  emu68k_vscsi_take(emu68k_vscsi_req_t *r, uint8_t **buf, uint32_t *bufsize);   /* 1 = a request was handed out */
+void emu68k_vscsi_done(uint32_t gen, unsigned status, uint32_t resid, int err);     /* status: SCSI status byte; err 0 / -1 no target / -2 bad request */
+void emu68k_vscsi_stats(emu68k_vscsi_stats_t *s);
+unsigned emu68k_vscsi_trace(uint32_t *out, unsigned max);   /* chained IOCS calls seen by the hook: d1<<16 | d4 */
+void emu68k_vscsi_set_mask(unsigned mask);          /* IDs the Pi serves (bit n = ID n); the X68000 handler reads it at +$34 */
+unsigned emu68k_vscsi_hook_info(uint32_t *hook, uint32_t *oldv, uint32_t *kept, uint32_t *resets);   /* returns the mask */
+/* "who is where" labels for VMPU68.X -d: index 0-7 = SCSI ID, 8-11 = FDD unit; core 0 fills them when requested */
+int  emu68k_vscsi_label_requested(void);
+void emu68k_vscsi_set_label(unsigned i, const char *s);     /* up to 31 chars */
+void emu68k_vscsi_labels_ready(void);
 
 #endif

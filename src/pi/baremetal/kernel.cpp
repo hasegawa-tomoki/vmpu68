@@ -35,6 +35,12 @@ void vmpu68_set_gpio_base(volatile unsigned int *base);
 void vmpu68_set_smi_base(volatile unsigned int *smi_base, volatile unsigned int *cm_base);
 void vmpu68_pace_bench(unsigned n);
 }
+#ifdef VMPU68_WITH_EMU
+#include "vscsi.h"
+#include "sdimg.h"
+#include "netfetch.h"
+#include "lanlabel.h"
+#endif
 
 #ifdef VMPU68_WITH_EMU
 static boolean s_gpclk_on = FALSE;   // gpclk <div> active (PLL test clock on BCM4/AD2)
@@ -168,6 +174,10 @@ void CEmuCore::Run (unsigned nCore)
 {
     if (nCore == 2)
         hw_wq_worker ();                       // posted-write queue: drives the GPIO strobes for core 1 (never returns)
+#ifdef VMPU68_WITH_EMU
+    if (nCore == 3)
+        vscsi_worker ();                       // virtual SCSI targets for the $ECD100 command port (never returns)
+#endif
     if (nCore != 1)
         for (;;) asm volatile ("wfe");
     for (;;)
@@ -3787,9 +3797,10 @@ void CKernel::BootX68 (const char *pWhy, unsigned nStatus, boolean bPowerOn)
     emu68k_rom_invalidate ();
     CLogger::Get ()->Write (FromKernel, LogNotice, "%s: booting (st=%04x, reset_in released after %u ms%s, [0]=%04x [4]=%04x rom=%04x [0]'=%04x, ram check bad=%u%s, rom cache bad=%u first=%06X, %u ms)",
                     pWhy, nStatus, waited, waited >= 5000 ? " - TIMEOUT" : "", m0, m1, m2, m3, rambad,
-                    (rambad || bPowerOn || bRamChanged) ? (sync ? " - resync FAILED" : " - resynced") : "",
+                    bPowerOn ? " - shadow cleared" : (rambad || bRamChanged) ? (sync ? " - resync FAILED" : " - resynced") : "",
                     rombad, first, (m_Timer.GetTicks () - t0) * 1000 / HZ);
     emu68k_reset ();
+    vscsi_on_reset ();                         // ejected virtual IDs go back to the real bus
     if (cfg_sramboot ())                       // boot screen program: (re)install when missing or outdated
     {
         int st = vmpu68_sramboot_state ();
@@ -3878,6 +3889,7 @@ TShutdownMode CKernel::Run (void)
     hw_wq_enable (0);                          // core-2 write queue off by default since 0.1.18 (docs 31: latency for raster/timer IRQ handlers); 'wq 1' turns it on for experiments
 #ifdef VMPU68_WITH_EMU
     emu_ensure ();                             // allocate the shadow on core 0
+    vscsi_init ();                             // the virtual SCSI test disk, before core 3 starts
     if (!m_EmuCore.Initialize ())
         CLogger::Get ()->Write (FromKernel, LogError, "multicore init failed");
 #endif
@@ -3902,6 +3914,7 @@ TShutdownMode CKernel::Run (void)
 #ifdef VMPU68_WATCHDOG
         m_Watchdog.Start (15);                 // reload
 #endif
+                   // and a copy on the card every second
         m_Scheduler.Yield ();                  // run network tasks
 
         // Wi-Fi after the machine is served: once the emulator runs (or the
@@ -4013,6 +4026,8 @@ TShutdownMode CKernel::Run (void)
             m_Net.GetConfig ()->GetIPAddress ()->Format (&IP);
             CLogger::Get ()->Write (FromKernel, LogNotice, "WLAN up: http://%s/",
                             (const char *) IP);
+            netfetch_init (&m_Net);            // LAN pulls (/api/fetch) use the same network stack
+            lanlabel_init (&m_Net);
             new CVmpuWebServer (&m_Net);
             m_bWebStarted = TRUE;
             g_pDiscovery = new CDiscovery (&m_Net);   // LAN beacon (vhd68/vfd68 style)
@@ -4025,6 +4040,7 @@ TShutdownMode CKernel::Run (void)
         }
         if (g_pDiscovery)
             g_pDiscovery->Poll ();
+        lanlabel_poll ();                          // VMPU68.X -d asked who is at which SCSI ID / FDD: ask vhd68 / vfd68
 
         // UART console
         char buf[64];

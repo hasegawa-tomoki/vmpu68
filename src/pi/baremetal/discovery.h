@@ -45,6 +45,7 @@ public:
     unsigned FormatPeers (char *pBuf, unsigned nSize) const;
 
     static const char *BuildLabel (void);   // "YYYYMMDD-HHMM" from __DATE__/__TIME__
+    const TDiscPeer *Peer (unsigned i) const { return i < DISC_MAX_PEERS && m_Peers[i].used ? &m_Peers[i] : 0; }   // slot i of the peer table
 
 private:
     CNetSubSystem *m_pNet;

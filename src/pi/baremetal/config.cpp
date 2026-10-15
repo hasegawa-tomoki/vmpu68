@@ -4,6 +4,7 @@
 #include <circle/util.h>
 
 static char s_Name[CFG_NAME_MAX] = "";
+static char s_VScsi[7][128]; static int s_VScsiRO[7];
 static unsigned s_RamMB;                // ram=<MB>, 0 = auto
 static unsigned s_MHz;                  // mhz=<n>, 0 = unlimited
 static unsigned s_WB = 1;               // wb=<0|1>, default write-back
@@ -47,6 +48,13 @@ void cfg_load (void)
             continue;
         if (strncmp (p, "name=", 5) == 0)
             set_name (p + 5);
+        else if (strncmp (p, "vscsi", 5) == 0 && p[5] >= '0' && p[5] <= '6' && p[6] == '=')
+        {
+            unsigned id = (unsigned) (p[5] - '0'); char *v = p + 7; unsigned n = 0;
+            while (v[n] && v[n] != '\r' && v[n] != '\n' && v[n] != ',' && n < sizeof s_VScsi[0] - 1) { s_VScsi[id][n] = v[n]; n++; }
+            s_VScsi[id][n] = 0;
+            s_VScsiRO[id] = (v[n] == ',' && v[n + 1] == 'r' && v[n + 2] == 'o') ? 1 : 0;
+        }
         else if (strncmp (p, "ram=", 4) == 0)
         {
             unsigned n = 0;
@@ -109,6 +117,8 @@ void cfg_set_smi (unsigned on) { s_SMI = on ? 1 : 0; }
 void cfg_set_board (unsigned id) { s_Board = (id == 1 || id == 2) ? id : 0; }
 void cfg_set (unsigned mhz, unsigned wb, unsigned jit) { s_MHz = mhz <= 1000 ? mhz : 0; s_WB = wb ? 1 : 0; s_JIT = jit ? 1 : 0; }
 void cfg_set_name (const char *v) { set_name (v); }
+const char *cfg_vscsi (unsigned id, int *ro) { if (id > 6) return ""; if (ro) *ro = s_VScsiRO[id]; return s_VScsi[id]; }
+void cfg_set_vscsi (unsigned id, const char *path, int ro) { if (id > 6) return; strncpy (s_VScsi[id], path ? path : "", sizeof s_VScsi[id] - 1); s_VScsi[id][sizeof s_VScsi[id] - 1] = 0; s_VScsiRO[id] = ro ? 1 : 0; }
 void cfg_set_ram (unsigned mb) { s_RamMB = mb <= 12 ? mb : 0; }
 
 // Rewrite the file: lines with the keys we own (name=, ram=, mhz=, wb=, jit=, sramboot=, board=, smi=)
@@ -124,7 +134,9 @@ int cfg_save (void)
         {
             const char *p = line; while (*p == ' ' || *p == '\t') p++;
             if (strncmp (p, "mhz=", 4) == 0 || strncmp (p, "wb=", 3) == 0 || strncmp (p, "jit=", 4) == 0 || strncmp (p, "sramboot=", 9) == 0 || strncmp (p, "board=", 6) == 0
-             || strncmp (p, "name=", 5) == 0 || strncmp (p, "ram=", 4) == 0 || strncmp (p, "smi=", 4) == 0) continue;
+             || strncmp (p, "name=", 5) == 0 || strncmp (p, "ram=", 4) == 0 || strncmp (p, "smi=", 4) == 0
+             || strncmp (p, "vboot=", 6) == 0   // vboot: a short-lived 2026-10-12 experiment, dropped from old files
+             || (strncmp (p, "vscsi", 5) == 0 && p[5] >= '0' && p[5] <= '6' && p[6] == '=')) continue;
             unsigned n = 0; while (line[n] && line[n] != '\r' && line[n] != '\n') n++;
             memcpy (keep[nk], line, n); keep[nk][n] = 0; nk++;
         }
@@ -150,6 +162,15 @@ int cfg_save (void)
     if (s_Board) { a = "board="; while (*a) tail[n++] = *a++; tail[n++] = (char) ('0' + s_Board); tail[n++] = '\n'; }
     if (!s_SMI)  { a = "smi=0\n"; while (*a) tail[n++] = *a++; }
     ok = ok && f_write (&f, tail, n, &bw) == FR_OK;
+    for (unsigned id = 0; id < 7; id++)
+    {
+        if (!s_VScsi[id][0]) continue;
+        char l[160]; unsigned k = 0; const char *q = "vscsi"; while (*q) l[k++] = *q++; l[k++] = (char) ('0' + id); l[k++] = '=';
+        for (q = s_VScsi[id]; *q && k < 150; q++) l[k++] = *q;
+        if (s_VScsiRO[id]) { l[k++] = ','; l[k++] = 'r'; l[k++] = 'o'; }
+        l[k++] = '\n';
+        ok = ok && f_write (&f, l, k, &bw) == FR_OK;
+    }
     f_sync (&f); f_close (&f);
     return ok ? 0 : -1;
 }
