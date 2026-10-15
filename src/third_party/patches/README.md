@@ -45,3 +45,30 @@ wpa_supplicant は同梱の .config そのままで `make`
   `m68kcpu.h`(例外ベクタへのジャンプ時に `M68K_EXCEPTION_HOOK` を呼ぶ 3 行の追加。例外の記録に使う)。
 - 適用: `cd src/third_party/Musashi && patch -p1 < ../patches/musashi-local.patch`
 - 命令表 `pi/core/gen/m68kops.c` はビルド時に Musashi の m68kmake で生成される(pi/core/Makefile)。
+
+## 4. circle-local.patch — HTTP デーモンの応答を自前で送る経路(vmpu68 の /api/file)
+
+`include/circle/net/http.h`, `include/circle/net/httpdaemon.h`, `lib/net/httpdaemon.cpp`:
+
+- CHTTPDaemon は応答全体を内容バッファ(MAX_CONTENT_SIZE、64 KB)に作って送るので、
+  ディスクイメージのような大きなファイルを流せない。`GetContent()` の中で
+  `GetSocket()`(protected に追加)を使ってヘッダとファイルを自分で送り、
+  `HTTPResponseSent`(= 1、追加)を返すとデーモンは接続を閉じるだけになる。
+- 適用後は `lib/net` を再ビルド(`cd lib/net && make`)。
+
+## 5. circle-local.patch — HTTP デーモンは応答後にクライアントの切断を待ってから閉じる(2026-10-13)
+
+`include/circle/net/httpdaemon.h`, `lib/net/httpdaemon.cpp`(`CloseAfterResponse()`):
+
+- 症状: スクリプトや Web UI が短い HTTP 要求を毎秒 20 回以上出し続けると、
+  1 分ほどで新しい接続が拒否される(SYN に RST が返り、クライアントは
+  「Connection refused」)。カーネルは止まっておらず、しばらくすると回復する。
+- 原因: CHTTPDaemon は応答を送るとすぐソケットを削除する(FIN を先に出す
+  能動クローズ)ため、閉じた接続が TIME-WAIT(60 秒)に残る。circle の
+  TCP は生きている接続オブジェクトが `TCP_MAX_CONNECTIONS`(1000)に達すると
+  LISTEN 状態で SYN に RST を返す。tcpdump で確認(RST は seq 0、ack = ISN+1)。
+- 修正: 応答を送ったあと受信タイムアウト 300 ms で `Receive()` し、
+  クライアント(`Connection: close` なので本文を受け取るとすぐ閉じる)の
+  FIN を先に受けてから削除する(受動クローズ: CLOSE-WAIT → LAST-ACK → CLOSED、
+  TIME-WAIT なし)。300 ms 以内に閉じないクライアントは従来どおり能動クローズ。
+- 適用後は `lib/net` を再ビルド(`cd lib/net && make`)し、カーネルを再リンク。
