@@ -31,3 +31,4 @@ __pycache__/
 .tmp_*
 src/x68k/jitbench/*.bin
 src/x68k/jitbench/*.X
+*.vcd
