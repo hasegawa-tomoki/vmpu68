@@ -2,7 +2,7 @@
 // 68000 bus master engine — phase 2.
 //
 // Runs in the PLL (clk16 x 61/16) domain; bus-facing state advances on
-// tick16, one pulse per bus clock, phased like a 68000's S-states.
+// tick16 / tick16h, one pulse per bus-clock edge (see the timing notes).
 //
 // Phase-2 additions:
 //  - posted-write command FIFO (64 deep, BRAM): the Pi can fire-and-forget
@@ -25,16 +25,17 @@
 //  - bus-clock-synchronous outputs (docs 57): every bus output leaves the
 //    FPGA through an SB_IO output register clocked by the bus clock itself
 //    (vmpu68_top), so its position on the bus no longer depends on the
-//    61/16 PLL phase.  The FSM prepares each value one bus clock ahead.
+//    61/16 PLL phase.  The FSM decides each value on the tick half a bus
+//    clock before the edge that captures it.
 `default_nettype none
 
 module bus_engine #(parameter SNOOP_AW = 9) (
     input  wire        clk,
     input  wire        tick16,
     input  wire        tick16h,     // same, half a bus clock later (falling edge phase)
-    input  wire        slow,        // REG3 bit12: legacy 5-tick cycles (END/address on tick16)
+    input  wire        slow,        // REG3 bit12: rd5 (5-clock reads) until configuration register 1 is written
     input  wire [1:0]  wr_setup,    // REG3 bit15:14: extra bus clocks (ticks) of write-data setup before AS,
-                                    // WEN -> WPRE x n -> ADDR.  At a 16 MHz bus clock main RAM lost about 1 in
+                                    // WEN3 -> RDW x n -> ADDR.  At a 16 MHz bus clock main RAM lost about 1 in
                                     // 2000 words (2.6% of $FFFF words) written right after the bus had floated:
                                     // the DRAM sampled the data before the many rising lines had settled.
                                     // One extra tick cut that 100x, two make it zero (docs 27.13).
@@ -162,8 +163,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
                ST_GRUN   = 4'd11,
                ST_UNGISO = 4'd12,
                ST_WEN3   = 4'd13,
-               ST_RDW    = 4'd14,   // 5-clock reads: one idle tick before AS
-               ST_LATCH  = 4'd15;   // read data latched, half a clock after the strobes were released
+               ST_RDW    = 4'd14;   // idle tick(s) before AS: rd5 for reads, wr_setup for writes
 
     reg [3:0]  st = ST_IDLE;
     reg [11:0] wdog;
@@ -185,53 +185,58 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     assign pf_count  = pf_cnt;
     assign pf_head   = pf_q[pf_rp[2:0]];
 
-    // ---- bus timing (docs 57, variant D: address group on the rising edge) ----
+    // ---- bus timing (docs 57) ----
     // Every bus output leaves the FPGA through an SB_IO output register that
     // is clocked by the bus clock itself (vmpu68_top).  Address, FC, R/W and
-    // data are registered on the falling edge; AS/UDS/LDS use the DDR output:
-    // *_r is what the pin shows after a rising edge, *_f after a falling
-    // edge, so a strobe can be asserted at a rising edge (a 68000's S2/S4)
-    // and released at a falling edge (S7).  The bus sees every change ~10 ns
-    // after the edge (IO register clock-to-out + the 8T245) at a fixed
+    // data are registered on the RISING edge; AS/UDS/LDS use the DDR output,
+    // *_r being what the pin shows after a rising edge and *_f after a
+    // falling edge, so a strobe is asserted at a rising edge (a 68000's
+    // S2/S4) and released at a falling edge (S7).  The bus sees every change
+    // ~10 ns after the edge (IO register clock-to-out + the 8T245) at a fixed
     // position: the 61/16 sampling jitter of the ticks (docs 56.13) no
-    // longer reaches the bus.
+    // longer reaches the bus.  The X68000 samples address, data and AS right
+    // after a falling edge and right before a rising edge (docs 57: the
+    // variants that changed them there lost whole words), hence the rising
+    // edge for the address group.
     // A tick's FSM update lands within about -7..+9 ns of the bus-clock edge
-    // it belongs to (the edge sampled on a clk negedge, two clk stages, the
-    // clock input path), so a value decided on tick16 (the rising-edge tick)
-    // is captured by the FALLING-edge registers and vice versa: 30 ns minus
-    // 9 minus the routing of setup, and the capture can never race the
-    // decision.  Hence: *_r and the address group are decided on tick16h
-    // ... no: address/FC/R/W/data (falling-edge registers) are decided on
-    // tick16 (IDLE/END), *_r (rising-edge values) on tick16h (ADDR/STROBE),
-    // *_f (falling-edge values) on tick16 (WAIT/VPA release).  Between the
-    // decisions each strobe register follows the other one (see the FSM),
-    // so a value asserted at a rising edge stays asserted through the next
-    // falling edge and a release at a falling edge holds through the next
-    // rising edge.
+    // it was detected from (the edge sampled on a clk negedge, two clk
+    // stages, the clock input path): tick16 at the rising edge, tick16h at
+    // the falling edge.  A value decided on tick16h is therefore captured by
+    // the RISING-edge registers (address group, *_r) and a value decided on
+    // tick16 by the FALLING-edge registers (*_f): 30 ns minus 9 minus the
+    // routing of setup, and the capture can never race the decision.
+    // IDLE/END/RDW/ADDR/STROBE advance on tick16h, WSETUP/WAIT/VPA and the
+    // grant states on tick16.  Between the decisions each strobe register
+    // follows the other one (see the FSM), so a value asserted at a rising
+    // edge stays asserted through the next falling edge and a release at a
+    // falling edge holds through the next rising edge.
     //
-    // Read, 0 wait states (R_n = rising edge n, F_n = the falling edge after it):
-    //   R_0  IDLE/END : address, FC, R/W decided            -> bus F_0 + 10 ns
-    //   F_0  ADDR     : AS, UDS, LDS (*_r) decided          -> bus R_1 + 10 (a 68000's S1/S2)
-    //   R_1  WAIT     : (*_f follow; DTACK cannot be there yet)
-    //   R_2  WAIT     : the board sampled AS at R_2: not yet
-    //   R_3  WAIT     : dtack_s (DTACK as of ~F_2, the 68000's S4 end): strobes
-    //                   released (*_f) -> bus F_3 + 10 (S7)
-    //   F_3  LATCH    : read data latched (ld_q1 = the bus ~16 ns before the
-    //                   update, half a clock after seeing DTACK, strobes still
-    //                   asserted); *_r follow
-    //   R_4  END      : next command dispatched: address F_4 + 10 (a clock
-    //                   after the strobes went up), AS R_5 + 10: 4 clocks
-    //                   AS-to-AS, AS low 2.5 and high 1.5 clocks like a 68000.
-    //                   rd5 inserts an idle tick (RDW) before ADDR: 5 clocks.
-    // Write: IDLE/END (R_0) also loads the data register (bus F_0 + 10 once
-    // the D buffer drives); WSETUP (F_0) turns the buffer around at clk rate
-    // (OE off, DIR + drive, [the device has let go], OE on ~F_0 + 50) or,
-    // when it already drives, goes straight on; ADDR at F_1 (AS R_2 + 10),
-    // STROBE at F_2 (DS R_3 + 10, S4), WAIT from R_3, DTACK seen R_5 (or R_6),
-    // strobes released F_5 + 10, LATCH F_5 (nothing to latch), END R_6: the
-    // next write's data replaces the data at F_6 + 10 (a clock of hold) and
-    // its ADDR is at F_6 (AS R_7 + 10: 5 clocks AS-to-AS); otherwise the data
-    // is released at F_6 (rel_req).  wr_setup adds idle ticks before ADDR.
+    // Read, 0 wait states (F_n = falling edge n, R_n+1 = the rising edge after it):
+    //   F_0  IDLE/END : address, FC, R/W decided            -> bus R_1 + 10 ns
+    //   F_1  ADDR     : AS, UDS, LDS (*_r) decided          -> bus R_2 + 10 (a 68000's S2)
+    //   R_2  WAIT     : (*_f follow: the strobes stay on through F_2)
+    //   R_3  WAIT     : the board has just seen AS: no DTACK yet
+    //   R_4  WAIT     : dtack_s (DTACK as of ~F_3, the end of the 68000's S4):
+    //                   strobes released (*_f) -> bus F_4 + 10 (S7)
+    //   F_4  END      : read data latched (ld_q1 = the bus ~16 ns before the
+    //                   update, the strobes still asserted: S6/S7); the next
+    //                   command dispatched: address R_5 + 10 (half a clock
+    //                   after the strobes went up), AS R_6 + 10: 4 clocks
+    //                   AS-to-AS, AS low 2.5 and high 1.5 clocks, the address
+    //                   a clock ahead of AS.  rd5 inserts an idle tick (RDW)
+    //                   before ADDR: 5 clocks.
+    // Write: IDLE/END (F_0) also loads the data register (bus R_1 + 10 once
+    // the D buffer drives); WSETUP (R_1): when the buffer already drives
+    // (write after write) straight on to ADDR at F_1 (AS R_2 + 10); when it
+    // was receiving, the turnaround at clk rate (OE off, DIR + drive, [the
+    // device has let go], OE on ~R_1 + 50) runs past F_1, so ADDR is at F_2
+    // (AS R_3 + 10: a clock of data setup on the bus).  Then STROBE a clock
+    // later (DS at the next rising edge + 10, S4), WAIT from the following
+    // tick16, DTACK two clocks after AS, strobes released at the falling
+    // edge + 10, END at that falling edge: the next write's data replaces the
+    // data at the next rising edge + 10 (half a clock of hold); otherwise the
+    // data is released a clock later (rel_req, below).  wr_setup adds idle
+    // ticks (RDW) before ADDR.
     // Configuration register 1 (a CPU-space write, see dispatch): bit 0 =
     // rd5; until written rd5 = slow.  Register 0 (the output delay of FPGA
     // 1.0.1) is accepted and ignored.
@@ -243,22 +248,22 @@ module bus_engine #(parameter SNOOP_AW = 9) (
 
     wire exec_busy = (st == ST_ADDR) || (st == ST_RDW) || (st == ST_WSETUP) || (st == ST_WEN) || (st == ST_WEN2) ||
                      (st == ST_WEN3) || (st == ST_STROBE) || (st == ST_WAIT) || (st == ST_VPA) ||
-                     (st == ST_LATCH) || (st == ST_END);
-    // variant D: address/FC/R/W/data are captured at the RISING edge, so they
-    // are decided on tick16h together with the rising-edge strobe values
+                     (st == ST_END);
+    // address/FC/R/W/data are captured at the rising edge, so they are
+    // decided on tick16h together with the rising-edge strobe values
     // (IDLE/END/ADDR/STROBE/RDW); the falling-edge strobe release and the
     // buffer turnaround run on tick16 (WAIT/VPA/WSETUP).
     wire h_st    = (st == ST_IDLE) || (st == ST_END) || (st == ST_ADDR) || (st == ST_STROBE) ||
-                   (st == ST_LATCH) || (st == ST_RDW);                       // tick16h
+                   (st == ST_RDW);                                           // tick16h
     wire fast_st = (st == ST_WEN) || (st == ST_WEN2) || (st == ST_WEN3);    // D-buffer turnaround, clk rate
     wire adv     = h_st ? tick16h : (fast_st ? 1'b1 : tick16);              // tick16: WSETUP, WAIT, VPA, grant
     // speculative fetches are not "busy" for the Pi: it waits on pf_count
     assign busy = cmd_rdy || (exec_busy && !p_spec) || start;
 
     // Data-buffer release after a write (the old END2/END3), beside the FSM so
-    // that a following read's ADDR is not held up: at the F-tick after the
-    // strobes were negated (>= 30 ns of data hold) OE off, a clk later DIR
-    // back and the FPGA's drive off, a clk later OE on (bus -> FPGA).
+    // that a following read's ADDR is not held up: at the tick16h a bus clock
+    // after the strobes were negated (a clock of data hold) OE off, a clk
+    // later DIR back and the FPGA's drive off, a clk later OE on (bus -> FPGA).
     reg         rel_req = 1'b0;
     reg  [1:0]  rel = 2'd0;
     wire        rel_busy = rel_req || (rel != 2'd0);
@@ -406,8 +411,8 @@ module bus_engine #(parameter SNOOP_AW = 9) (
     wire        grant_ok = br_s && !snoop_afull && (!cmd_rdy || c_abr);
     wire        next_is_write = cmd_rdy && !c_rw && (c_fc != 3'b111) && !grant_ok;
 
-    // F-tick dispatch: used by IDLE and by the tail of END (so a 0-wait read
-    // is 4 bus clocks although every output is a bus clock late).
+    // tick16h dispatch: used by IDLE and by the tail of END (so a 0-wait read
+    // is 4 bus clocks AS-to-AS although the address leads AS by a clock).
     // commands posted before BR land first; then the grant (throttled while
     // the snoop FIFO drains); then the commands posted while the request was
     // pending (see the FIFO).  Speculative fetches come last.
@@ -526,9 +531,7 @@ module bus_engine #(parameter SNOOP_AW = 9) (
             dispatch(1'b0, pf_run, pf_a, pf_cnt, pf_fc);
         end
 
-        ST_RDW: st <= ST_ADDR;           // (tick16h) 5-clock reads: an idle tick before AS
-
-        ST_WSETUP: begin                 // (tick16h) the previous cycle's strobes left the bus at its falling edge
+        ST_WSETUP: begin                 // (tick16) the previous cycle's strobes left the bus at the falling edge just before
             if (rel_busy) begin end      // its data release is still running (rare): next tick
             else if (d_dir) begin        // the D buffer already drives (write after write)
                 pre_cnt <= wr_setup;

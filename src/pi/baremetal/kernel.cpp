@@ -1734,7 +1734,7 @@ static int exec_cmd (const char *line, put_fn out, void *ctx,
          * made every status poll a silent halt (docs 32.3) */
         R.Format ("emu %s (pc=%06X)\r\n", s_emu_run ? "running" : "stopped", emu68k_pc ());
     }
-    else if (p[0] == 'b' && p[1] == 'c' && p[2] == 'f')    // bcfg <reg> <val>: bus engine configuration register (CPU-space write; FPGA 1.0.2: reg 1 = rd5 (bit0, reads 5 clocks) / wr4 (bit1), docs 57)
+    else if (p[0] == 'b' && p[1] == 'c' && p[2] == 'f')    // bcfg <reg> <val>: bus engine configuration register (CPU-space write; FPGA 1.0.2: reg 1 bit0 = rd5 (reads 5 clocks), reg 0 (1.0.1's output delay) ignored, docs 57)
     {
         p += 4;
         while (*p == ' ') p++;
@@ -2784,6 +2784,7 @@ static void fpga_version_fixup (void)
             { 0xFB2EB282, 0x010001 },   // 1.0.1 (1.1.3: wr_setup on 4-clock cycles (docs 55), writes end on tick16 (56.6), data held to tick16h (56.11), dtack_drv/psram_ce driven (56.8), bus output delay by config register, default one clk when slow=0 (56.13/56.14))
             { 0xCFA4A6A1, 0x010001 },   // 1.0.1 rc17 (output delay fixed to slow=0 -> 1, no config register)
             { 0x3B251A61, 0x010001 },   // 1.0.1 rc16 (no output stage: cold-start write loss at 16 MHz, docs 56.13)
+            { 0xECA6D487, 0x010002 },   // 1.0.2 (bus outputs from IO registers clocked by the bus clock, docs 57: no output delay, no per-bitstream tuning; configuration register 1 = rd5)
         };
         for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) if (known[i].sum == sum && len == 135100) { flags = known[i].ver; from = "release table"; }
     }

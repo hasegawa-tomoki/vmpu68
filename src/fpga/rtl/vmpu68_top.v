@@ -95,15 +95,13 @@ module vmpu68_top #(parameter SNOOP_AW = 10) (
     );
 
     // clk16 edge detect in the fast domain.
-    // The bus FSM must move its outputs shortly after the clk16 rising
-    // edge like a 68000 does (AS within ~55ns of the S2 edge): the X68000
-    // memory controller is synchronous to this clock.  A rising-edge
-    // detector built from posedge samples only (3 stages) places the
-    // outputs 95-120ns after the edge at 10MHz - i.e. straddling the NEXT
-    // edge, where the controller sees them one clock late at random.
-    // Detecting the FALLING edge instead, with the first sample taken on
-    // the negative clk edge, puts the FSM update 39-65ns after the falling
-    // edge = 4-30ns after the following rising edge.
+    // The ticks pace the bus FSM.  The outputs are re-timed by the IO
+    // registers (docs 57), so a tick only has to land clear of the edge
+    // that captures the values decided on it: bus_engine decides every
+    // value on the tick of the opposite edge.  Detecting the FALLING edge,
+    // with the first sample taken on the negative clk edge, puts the FSM
+    // update 39-65ns after the falling edge at 10MHz = 4-30ns after the
+    // following rising edge (at 16.7MHz about -7..+9ns around it).
     reg       c16n;
     always @(negedge clk) c16n <= clk16_g;   // the same net that clocks the output registers
     reg [1:0] c16p;

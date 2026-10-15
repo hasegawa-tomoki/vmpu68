@@ -102,9 +102,10 @@ module tb_top;
     // ---------------- output phase assertions (docs 57) ----------------
     // While the engine owns the bus, AS/UDS/LDS may only be asserted right at
     // a clk16 rising edge and released right at a falling edge, and
-    // address/FC/R/W may only change at a falling edge (the IO registers;
-    // clock-to-out is zero in this model).  Changes in the same
-    // time step as an enable (own / ld_drive) are the pins going to or from Z.
+    // address/FC/R/W and the write data may only change at a rising edge
+    // (the IO registers; clock-to-out is zero in this model).  Changes in the
+    // same time step as an enable (own / ld_drive) are the pins going to or
+    // from Z.
     time t_rise = 0, t_fall = 0, t_own = 0, t_ldd = 0;
     always @(posedge clk16) t_rise = $time;
     always @(negedge clk16) t_fall = $time;
@@ -165,6 +166,16 @@ module tb_top;
     always @(posedge b_as_n) if (mon_as && as_fall != 0) begin
         if (as_lo_min == 0 || $time - as_fall < as_lo_min) as_lo_min = $time - as_fall;
         if ($time - as_fall > as_lo_max) as_lo_max = $time - as_fall;
+    end
+
+    // write-data setup monitor: the last address change -> AS assertion of a
+    // write cycle (the address and the data move together, docs 57)
+    reg mon_ws = 0;
+    realtime t_achg = 0, ws_min = 0, ws_max = 0;
+    always @(f_la) t_achg = $realtime;
+    always @(negedge f_as_n) if (mon_ws && f_rw === 1'b0) begin
+        if (ws_min == 0 || $realtime - t_achg < ws_min) ws_min = $realtime - t_achg;
+        if ($realtime - t_achg > ws_max) ws_max = $realtime - t_achg;
     end
 
     task pi_write(input [1:0] a, input [15:0] d);
@@ -756,8 +767,7 @@ module tb_top;
                 // in this model, 61/16 x clk16 on the hardware), and whether the model's DTACK (two
                 // clk16 edges after the strobes are sampled) lands before or after the next tick is a
                 // matter of the clock phase: the shortest cycle is N or N+1 bus clocks (N = 4 for the
-                // 4-clock class, 5 for the 5-clock one).  The output stage (docs 56.13) shifts every
-                // strobe by one clk and moves that boundary as well.  Accept N or N+1.
+                // 4-clock class, 5 for the 5-clock one).  Accept N or N+1.
                 if (as_min != (m ? 64'd312 : 64'd250) && as_min != (m ? 64'd375 : 64'd312)) begin
                     $display("FAIL cyc_len: AS-to-AS min %0t, want %0d or %0d bus clocks", as_min, m ? 5 : 4, m ? 6 : 5);
                     errors = errors + 1;
@@ -769,8 +779,8 @@ module tb_top;
 
         // 14. engine configuration by a CPU-space write (docs 57): consumed by
         // the engine, no bus cycle; register 1 bit 0 = rd5 (reads take an idle
-        // tick before AS: 5 clocks), bit 1 = wr4.  Register 0 (FPGA 1.0.1's
-        // output delay) is accepted and ignored.
+        // tick before AS: 5 clocks).  Register 0 (FPGA 1.0.1's output delay)
+        // is accepted and ignored.
         begin : cfg_wr
             integer k;
             mon_as = 1; as_fall = 0; as_min = 0; as_max = 0; as_n_cyc = 0; as_lo_min = 0; as_lo_max = 0;
@@ -816,6 +826,37 @@ module tb_top;
             end
             bus_cycle(1'b1, 1'b1, 24'h004400, 16'h0, rd);   // flush the stream
             $display("pass cfg write (rd5 1/0)");
+        end
+
+        // 15. wr_setup (REG3 bits 15:14): n idle ticks (RDW) between the
+        // address/data and AS of a write.  A write that follows a read turns
+        // the D buffer around first, which runs past the next tick: its AS is
+        // 2 + n clocks after the address, a write after a write 1 + n.  (The
+        // RDW counting was dead code in the first docs-57 builds: n >= 2
+        // behaved like 1.)  The posted writes here are slower than the bus,
+        // so every write follows a release and sees 2 + n.
+        begin : wsetup_t
+            integer n, k;
+            for (n = 0; n < 3; n = n + 1) begin
+                pi_write(2'd3, 16'h0040 | (n[15:0] << 14));
+                mon_ws = 1; ws_min = 0; ws_max = 0;
+                for (k = 0; k < 8; k = k + 1)
+                    post_write(24'h004600 + n[23:0] * 24'h40 + 2 * k[23:0], 16'hC000 + k[15:0] + n[15:0] * 16'h100);
+                pi_read(2'd3, st);
+                while (st[0]) pi_read(2'd3, st);
+                mon_ws = 0;
+                $display("info wr_setup %0d: address-to-AS min %0t max %0t", n, ws_min, ws_max);
+                if (ws_max < 62.5 * (n + 2) - 0.5 || ws_max > 62.5 * (n + 2) + 0.5 ||
+                    (ws_min < 62.5 * (n + 1) - 0.5 || ws_min > 62.5 * (n + 1) + 0.5) &&
+                    (ws_min < 62.5 * (n + 2) - 0.5 || ws_min > 62.5 * (n + 2) + 0.5)) begin
+                    $display("FAIL wr_setup %0d: address-to-AS min %0t max %0t, want %0d / %0d clocks", n, ws_min, ws_max, n + 1, n + 2);
+                    errors = errors + 1;
+                end
+                bus_cycle(1'b1, 1'b1, 24'h004600 + n[23:0] * 24'h40 + 24'd14, 16'h0, rd);
+                if (rd !== 16'hC007 + n[15:0] * 16'h100) begin $display("FAIL wr_setup %0d word 7: %04x", n, rd); errors = errors + 1; end
+            end
+            pi_write(2'd3, 16'h0040);
+            $display("pass wr_setup 0/1/2");
         end
 
         // 6c (last: it grants the bus to the DMAC model and would upset the measurements below)
